@@ -1,11 +1,13 @@
 from langchain_chroma import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
-from sentence_transformers import SentenceTransformer
-import subprocess
 import os
 
 # === 1. Konfiguration ===
-CHROMA_DB_PATH = r"D:\Users\doman\Documents\OneDrive\Dokumente\Programmierung\Projekte\AiAgents\chats"
+CHROMA_DB_PATH = r"D:\\Users\\doman\\Documents\\OneDrive\\Dokumente\\Programmierung\\Projekte\\AiAgents\\chats"
+RELEVANZ_THRESHOLD = 0.5
+KEYWORD_BONUS = 0.2
+GEWICHT_EMBEDDING = 0.7
+GEWICHT_KEYWORD = 0.3
 
 # === 2. Embedding-Funktion ===
 embedding_function = HuggingFaceEmbeddings(
@@ -21,45 +23,54 @@ vectordb = Chroma(
 )
 
 # === 4. Nutzerabfrage ===
-user_input = input("\n➡️ Bitte gib einen Suchtext ein (z. B. 'Roboter mit Akku'): ")
+user_input = input("\n➡️ Bitte gib einen Suchtext ein (z. B. 'Roboter mit Akku'): ").strip()
 query = f"query: {user_input}"
 
-if not query.strip():
+if not user_input:
     print("❗ Kein Suchtext eingegeben.")
     exit()
 
-# === 5. Suche durchführen ===
-print("\n🔍 Ähnliche Chats gefunden (sortiert nach Relevanz):\n")
-results = vectordb.similarity_search_with_score(query, k=10)
+suchwoerter = user_input.lower().split()
 
-relevanz_threshold = 0.60
+# === 5. Embedding-Suche durchführen ===
+print("\n🔍 Debug-Ausgabe für kombinierte Relevanz:\n")
+results = vectordb.similarity_search_with_score(query, k=15)
 
-# Score umwandeln in Relevanz (1 - score), sortieren absteigend
-relevanz_results = [
-    (doc, 1 - score) for doc, score in results
-    if isinstance(score, float) and (1 - score) >= relevanz_threshold
-]
-relevanz_results.sort(key=lambda x: x[1], reverse=True)
+anzeige_liste = []
 
-# === 6. Ergebnisse anzeigen ===
-if not relevanz_results:
-    print("😕 Keine relevanten Ergebnisse gefunden.")
+for i, (doc, score) in enumerate(results, 1):
+    if not isinstance(score, float):
+        continue
+
+    embedding_relevanz = 1 - score
+    title = doc.metadata.get("title", "").lower()
+    inhalt = doc.page_content.lower()
+
+    # Keyword-Bonus prüfen
+    keyword_bonus = 0.0
+    for wort in suchwoerter:
+        if wort in title or wort in inhalt:
+            keyword_bonus = KEYWORD_BONUS
+            break
+
+    # Kombinierter Score
+    gesamt_relevanz = (embedding_relevanz * GEWICHT_EMBEDDING) + (keyword_bonus * GEWICHT_KEYWORD)
+
+    print(f"{i}. Titel: {title[:80]}...")
+    print(f"   🔹 Embedding-Relevanz: {embedding_relevanz:.3f}")
+    print(f"   🔸 Keyword-Bonus: {keyword_bonus:.3f}")
+    print(f"   ✅ Gesamt-Relevanz: {gesamt_relevanz:.3f} (Threshold: {RELEVANZ_THRESHOLD})")
+
+    if gesamt_relevanz >= RELEVANZ_THRESHOLD:
+        anzeige_liste.append((gesamt_relevanz, title))
+        print("   ➕ Wird angezeigt\n")
+    else:
+        print("   ➖ Zu niedrig für Anzeige\n")
+
+# === 6. Ausgabe anzeigen ===
+if anzeige_liste:
+    print("\n📋 Ergebnisse mit ausreichend Relevanz:")
+    for score, title in sorted(anzeige_liste, reverse=True):
+        print(f"🔸 {title} (Score: {score:.3f})")
 else:
-    for i, (doc, relevanz) in enumerate(relevanz_results, 1):
-        title = doc.metadata.get("title", "Kein Titel")
-        chat_id = doc.metadata.get("chat_id", "Unbekannt")
-        prompt = f"Fasse den folgenden Chat knapp zusammen (max. 5 Sätze):\n\n{doc.page_content[:4000]}"
-
-        result = subprocess.run(
-            ["ollama", "run", "llama3", prompt],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            encoding="utf-8",
-            errors="ignore"
-        )
-        snippet = result.stdout.strip()
-
-        print(f"{i}. Titel: {title}")
-        print(f"   Relevanz: {relevanz:.2f}")
-        print(f"   Inhalt (Auszug): {snippet}\n")
+    print("❌ Keine Ergebnisse über dem Relevanz-Threshold.")
