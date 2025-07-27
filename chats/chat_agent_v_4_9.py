@@ -9,6 +9,8 @@ import pandas as pd
 import re
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 import os
 
@@ -17,8 +19,14 @@ SKIP_UNVERÄNDERTE_CHATS = False
 
 vectordb = None
 
+
 def init_chroma():
-    embeddings = OllamaEmbeddings(model="bge-m3")
+    model_name = "intfloat/e5-large-v2"
+    embeddings = HuggingFaceEmbeddings(
+    model_name=model_name,
+    model_kwargs={"device": "cpu"},  # oder "cuda" bei GPU
+    encode_kwargs={"normalize_embeddings": True}
+)
     vectordb = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
     return vectordb
 
@@ -209,7 +217,7 @@ def verarbeite_chat(chat, kategorien, stichwort_mapping, cursor):
             )
 
 def speichere_embedding(chat_id, title, summary, content, overwrite=True):    
-    text = f"{title}\n{summary}\n{content}"
+    text = f"passage: Titel: {title}\nZusammenfassung: {summary}\nInhalt: {content}"
 
     metadata = {
         "chat_id": chat_id,
