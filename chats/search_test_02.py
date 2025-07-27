@@ -4,10 +4,11 @@ import os
 
 # === 1. Konfiguration ===
 CHROMA_DB_PATH = r"D:\\Users\\doman\\Documents\\OneDrive\\Dokumente\\Programmierung\\Projekte\\AiAgents\\chats"
-RELEVANZ_THRESHOLD = 0.5
-KEYWORD_BONUS = 0.2
-GEWICHT_EMBEDDING = 0.7
-GEWICHT_KEYWORD = 0.3
+RELEVANZ_THRESHOLD = 0.36
+KEYWORD_BONUS_MAX = 0.3
+GEWICHT_EMBEDDING = 0.6
+GEWICHT_KEYWORD = 0.4
+TITEL_WEIGHT = 1.5  # Gewichtung für Treffer im Titel
 
 # === 2. Embedding-Funktion ===
 embedding_function = HuggingFaceEmbeddings(
@@ -31,9 +32,10 @@ if not user_input:
     exit()
 
 suchwoerter = user_input.lower().split()
+anzahl_woerter = len(suchwoerter)
 
 # === 5. Embedding-Suche durchführen ===
-print("\n🔍 Debug-Ausgabe für kombinierte Relevanz:\n")
+print("\n🔍 Debug-Ausgabe für kombinierte Relevanz (mit gewichteten Keywords):\n")
 results = vectordb.similarity_search_with_score(query, k=15)
 
 anzeige_liste = []
@@ -46,19 +48,24 @@ for i, (doc, score) in enumerate(results, 1):
     title = doc.metadata.get("title", "").lower()
     inhalt = doc.page_content.lower()
 
-    # Keyword-Bonus prüfen
-    keyword_bonus = 0.0
+    keyword_score = 0.0
     for wort in suchwoerter:
-        if wort in title or wort in inhalt:
-            keyword_bonus = KEYWORD_BONUS
-            break
+        if wort in title:
+            keyword_score += TITEL_WEIGHT
+        elif wort in inhalt:
+            keyword_score += 1.0
+
+    # Normieren auf max mögliche Punktzahl (TITEL_WEIGHT * anzahl_woerter)
+    max_score = TITEL_WEIGHT * anzahl_woerter
+    keyword_ratio = min(keyword_score / max_score, 1.0) if anzahl_woerter > 0 else 0
+    keyword_bonus = keyword_ratio * KEYWORD_BONUS_MAX
 
     # Kombinierter Score
     gesamt_relevanz = (embedding_relevanz * GEWICHT_EMBEDDING) + (keyword_bonus * GEWICHT_KEYWORD)
 
     print(f"{i}. Titel: {title[:80]}...")
     print(f"   🔹 Embedding-Relevanz: {embedding_relevanz:.3f}")
-    print(f"   🔸 Keyword-Bonus: {keyword_bonus:.3f}")
+    print(f"   🔸 Keyword-Bonus (gewichtet): {keyword_bonus:.3f}")
     print(f"   ✅ Gesamt-Relevanz: {gesamt_relevanz:.3f} (Threshold: {RELEVANZ_THRESHOLD})")
 
     if gesamt_relevanz >= RELEVANZ_THRESHOLD:
