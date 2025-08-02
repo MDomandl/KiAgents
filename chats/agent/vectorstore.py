@@ -15,6 +15,7 @@ def speichere_embedding(chat_id, title, summary, content, vectordb, overwrite=Tr
     text = f"passage: Titel: {title}\nZusammenfassung: {summary}\nInhalt: {content}"
     metadata = {"chat_id": chat_id, "title": title}
     print(f"🔄 Speichere Embedding für Chat {chat_id}...")
+    print(f"✅ Eingefügt in Chroma: {chat_id} – {title[:50]}...")
     if not overwrite:
         result = vectordb.similarity_search(text, k=3)
         for doc in result:

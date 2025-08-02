@@ -1,5 +1,6 @@
 from langchain_chroma import Chroma
 from langchain.embeddings import HuggingFaceEmbeddings
+import pymysql
 import os
 
 # === 1. Konfiguration ===
@@ -8,6 +9,7 @@ RELEVANZ_THRESHOLD = 0.36
 KEYWORD_BONUS_MAX = 0.3
 GEWICHT_EMBEDDING = 0.6
 GEWICHT_KEYWORD = 0.4
+GEWICHT_KATEGORIE = 0.25
 TITEL_WEIGHT = 1.5  # Gewichtung für Treffer im Titel
 
 # === 2. Embedding-Funktion ===
@@ -22,6 +24,58 @@ vectordb = Chroma(
     persist_directory=CHROMA_DB_PATH,
     embedding_function=embedding_function
 )
+
+def verbinde_mit_datenbank():
+    return pymysql.connect(
+        host="127.0.0.1",
+        user="chatuser",
+        password="chatpass",
+        database="gptchats",
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+conn = verbinde_mit_datenbank()
+cursor = conn.cursor()
+
+def hole_zusammenfassung(chat_id, cursor):
+    cursor.execute("SELECT zusammenfassung FROM chats WHERE chat_id = %s", (chat_id,))
+    row = cursor.fetchone()   
+    return row if row else "[keine Zusammenfassung]"
+
+def hole_id(chat_id, cursor):
+    cursor.execute("SELECT id FROM chats WHERE chat_id = %s", (chat_id,))
+    row = cursor.fetchone()   
+    return row if row else "[keine id]"
+
+def hole_kategorien(chat_id, cursor):
+    print(f"ich hole: {chat_id}...")
+    cursor.execute("""
+        SELECT k.name, ck.relevanz 
+        FROM chat_kategorien ck
+        JOIN kategorien k ON ck.kategorie_id = k.id
+        WHERE ck.chat_id = %s
+        ORDER  BY ck.relevanz
+    """, (chat_id,))   
+    return {row["name"].lower() for row in cursor.fetchall()}
+
+def normalisiere(s: str) -> str:
+    return s.lower().strip()
+
+def erkenne_query_kategorien(query: str, alle_kategorien: list[str]) -> set[str]:
+    q = normalisiere(query)
+    tokens = set(q.split())
+    # einfache Heuristik: Kategorie-Name kommt als ganzes Wort in der Query vor
+    return {k for k in alle_kategorien if normalisiere(k) in tokens}
+
+def kategorie_match_score(chat_id: str, query_kats: set[str], kat_by_chat: dict) -> float:
+    paare = kat_by_chat.get(chat_id, [])
+    # Relevanz normalisieren (0..1) und nur passende Kategorien berücksichtigen
+    scores = [(rel / 100.0) for (name, rel) in paare if normalisiere(name) in query_kats]
+    if not scores:
+        return 0.0
+    return max(scores)   # oder sum(scores)/len(scores)
+
 
 # === 4. Nutzerabfrage ===
 user_input = input("\n➡️ Bitte gib einen Suchtext ein (z. B. 'Roboter mit Akku'): ").strip()
@@ -45,7 +99,8 @@ for i, (doc, score) in enumerate(results, 1):
         continue
 
     embedding_relevanz = 1 - score
-    title = doc.metadata.get("title", "").lower()
+    title = doc.metadata.get("title", "").lower()  
+    chat_id = doc.metadata.get("chat_id", "keine chat_id").lower()      
     inhalt = doc.page_content.lower()
 
     keyword_score = 0.0
@@ -69,7 +124,7 @@ for i, (doc, score) in enumerate(results, 1):
     print(f"   ✅ Gesamt-Relevanz: {gesamt_relevanz:.3f} (Threshold: {RELEVANZ_THRESHOLD})")
 
     if gesamt_relevanz >= RELEVANZ_THRESHOLD:
-        anzeige_liste.append((gesamt_relevanz, title))
+        anzeige_liste.append((gesamt_relevanz, title, chat_id))
         print("   ➕ Wird angezeigt\n")
     else:
         print("   ➖ Zu niedrig für Anzeige\n")
@@ -77,7 +132,14 @@ for i, (doc, score) in enumerate(results, 1):
 # === 6. Ausgabe anzeigen ===
 if anzeige_liste:
     print("\n📋 Ergebnisse mit ausreichend Relevanz:")
-    for score, title in sorted(anzeige_liste, reverse=True):
-        print(f"🔸 {title} (Score: {score:.3f})")
+    for score, title, chat_id in sorted(anzeige_liste, reverse=True):
+        zusammenfassung =  hole_zusammenfassung(chat_id, cursor)    
+        id = hole_id(chat_id, cursor)['id']       
+        kategorien = hole_kategorien(id, cursor)      
+        print(f"🔸 id is at: {kategorien}")  
+        print(f"🔸 {title} (Score: {score:.3f}) {chat_id}")
+        if kategorien:
+            print(f"   🏷️ Kategorien: {', '.join(kategorien)}")
+        print(f"   📝 {zusammenfassung['zusammenfassung'][:300]}{'...' if len(zusammenfassung) > 300 else ''}\n")
 else:
     print("❌ Keine Ergebnisse über dem Relevanz-Threshold.")

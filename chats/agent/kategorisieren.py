@@ -1,16 +1,32 @@
 import subprocess
 import re
 
+def braucht_llm_kategorisierung(chat_id, cursor):
+    cursor.execute(
+        "SELECT COUNT(*) as anzahl FROM chat_kategorien WHERE chat_id = %s AND quelle IN ('llama3', 'gpt4')",
+        (chat_id,)
+    )
+    result = cursor.fetchone()
+    return result["anzahl"] == 0
+
+def hole_kategorien(cursor):
+    cursor.execute("SELECT id, name FROM kategorien")
+    return {row["name"].lower(): row["id"] for row in cursor.fetchall()}
+
 def generiere_kategorievorschlag(text, kategorien_liste):
     kategorien_str = ", ".join(kategorien_liste)
     prompt = (
         f"Weise dem folgenden Inhalt eine oder mehrere passende Kategorien zu:\n"
-        f"{kategorien_str}\n\nInhalt:\n{text}\n\n"
-        f"Gib die Antwort bitte ausschließlich(!) im folgenden Format zurück:\n"
-        f"* Bewerbung: 5/5"
+        f"{kategorien_str}\n\n"
+        f"Inhalt:\n{text}\n\n"
+        f"Gib die Antwort bitte ausschließlich(!) im folgenden Format zurück ohne Erklärungen oder mehrere Kategorien pro Zeile:\n"
+        f"* Verkehr: 4/5"
+        f"\nUnd gib für jede Kategorie eine Relevanz an wie: 4/5"
+        f"\nBeispiel: \n* Bewerbung: 5/5"
+        f"\nBitte keine Zeile mit N/A ausgeben"
     )
     result = subprocess.run(["ollama", "run", "llama3", prompt],
-                            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
+                            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="ignore")
     return result.stdout.strip()
 
 def extrahiere_kategorien_und_relevanz(text, kategorien_liste):

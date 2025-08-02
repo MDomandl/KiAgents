@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat-Agent Suche</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>🔍 Chat-Agent Suche</h1>
+    <form method="POST">
+        <input type="text" name="query" placeholder="Suchbegriff..." required>
+        <button type="submit">Suchen</button>
+    </form>
+
+    {% if results %}
+        <h2>Ergebnisse:</h2>
+        <ul>
+            {% for row in results %}
+                <li>
+                    <strong>{{ row.titel }}</strong><br>
+                    Relevanz: {{ row.relevanz }}<br>
+                  Kategorie(n): {{ row.kategorien or '–' }}<br>
+                    <em>{{ row.zusammenfassung or 'Keine Zusammenfassung vorhanden' }}</em>
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</body>
+</html>
