@@ -1,4 +1,4 @@
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from rich.console import Console
 from rich.table import Table
 import ollama
@@ -6,7 +6,7 @@ import ollama
 console = Console()
 
 # 🎯 Deine Kriterien
-suchkriterien = "Theaterstück schwarzer Humor 4 bis 6 Rollen kleine Bühne alter der Schuspieler 60 Jahre stücke für Erwachsene saalbühne site:theatertexte.de"
+suchkriterien = "Theaterstück mit schwarzer Humor 4 bis 6 Rollen kleine Bühne alter der Schauspieler ca. 60 Jahre Stücke für Erwachsene saalbühne keine Mundart site:theatertexte.de"
 
 console.print(f"\n🔍 Suche nach: [bold green]{suchkriterien}[/bold green]")
 

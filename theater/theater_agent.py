@@ -5,7 +5,9 @@ from langchain.agents.agent_types import AgentType
 import os
 
 # 🔑 API-Key hier einsetzen
-os.environ["OPENAI_API_KEY"] = "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"
+# siehe Keepass
+
+
 
 # 🔍 Suchwerkzeug aktivieren
 search = DuckDuckGoSearchRun()
