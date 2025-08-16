@@ -11,13 +11,14 @@ from collections import Counter
 # =====================
 # Konfiguration
 # =====================
-ADJUSTED = True          # Bereinigte Kurse (Splits/Dividenden) verwenden
-PERIOD   = "250d"        # Downloadzeitraum (etwas länger = stabilere SMAs/Regression)
-DAYS_WIN = 100           # Fenster für die Auswertung
-GAP_TH   = 0.18          # Max. erlaubtes Tagesgap (18%)
-VERBOSE  = False         # Mehr Diagnoseausgaben
+ADJUSTED = True           # Bereinigte Kurse (Splits/Dividenden) verwenden
+PERIOD   = "400d"         # Längerer Zeitraum, damit 12-1 Momentum (≈252 Handelstage) sicher berechnet werden kann
+DAYS_WIN = 100            # Fenster für die lineare Trend-Auswertung
+GAP_TH   = 0.18           # Max. erlaubtes Tagesgap (18%)
+ADV_MIN_DOLLARS = 2_000_000  # Mindestdurchschnittsumsatz (Close*Volume über 20 Tage) in USD/EUR
+VERBOSE  = False          # Mehr Diagnoseausgaben
 
-FAIL = Counter()         # Zähler, warum Titel rausfallen
+FAIL = Counter()          # Zähler, warum Titel rausfallen
 
 
 # =====================
@@ -76,7 +77,7 @@ def download_ohlc(ticker: str, period: str = PERIOD, adjusted: bool = ADJUSTED) 
     if df is not None:
         return df
 
-    # Fallback (zur Sicherheit): nochmal ohne Adjust laden
+    # Fallback (zur Sicherheit): nochmal mit auto_adjust=True laden
     df = yf.download(ticker, period=period, interval="1d",
                      progress=False, auto_adjust=True, threads=False)
     return ensure_ohlc(df, ticker)
@@ -94,6 +95,34 @@ def kein_großes_gap_series(series, threshold: float = GAP_TH) -> tuple[bool, fl
         return True, 0.0
     mg = float(gaps.max())
     return (mg < threshold), mg
+
+
+def avg_dollar_volume(df: pd.DataFrame, win: int = 20) -> float | None:
+    """Durchschnittlicher Tagesumsatz: Close * Volume (rollierend)."""
+    if "Close" not in df.columns or "Volume" not in df.columns:
+        return None
+    ser = (_as_series(df["Close"], "Close") * _as_series(df["Volume"], "Volume")).rolling(win).mean()
+    ser = ser.dropna()
+    if ser.empty:
+        return None
+    return float(ser.iloc[-1])
+
+
+def mom_12_1(close: pd.Series) -> float | None:
+    """12-1 Momentum: Rendite der letzten 12 Monate ohne den letzten Monat.
+       ≈ c[t-21] / c[t-252] - 1
+    """
+    c = _as_series(close, "Close").dropna()
+    if len(c) < 252:
+        return None
+    try:
+        start = float(c.iloc[-252])
+        end   = float(c.iloc[-21])
+        if start == 0:
+            return None
+        return end / start - 1.0
+    except Exception:
+        return None
 
 
 # =====================
@@ -125,13 +154,27 @@ def sp500_above_200dma() -> bool:
 # =====================
 def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
     try:
-        df = download_ohlc(ticker, period=PERIOD, adjusted=ADJUSTED)
-        if df is None or df.empty:
+        df_full = download_ohlc(ticker, period=PERIOD, adjusted=ADJUSTED)
+        if df_full is None or df_full.empty:
             if VERBOSE: print(f"{ticker}: keine OHLC-Daten.")
             FAIL["no_data"] += 1
             return None
 
-        df = df.dropna(subset=["Close", "High", "Low"])
+        # (a) Liquidität: 20-Tage Durchschnittsumsatz
+        adv = avg_dollar_volume(df_full, 20)
+        if adv is not None and adv < ADV_MIN_DOLLARS:
+            if VERBOSE: print(f"{ticker}: illiquide (ADV={adv:,.0f} < {ADV_MIN_DOLLARS:,.0f}).")
+            FAIL["illiquid"] += 1
+            return None
+
+        # (b) 12-1 Momentum auf dem langen Fenster (df_full)
+        m121 = mom_12_1(df_full["Close"])
+        # Nicht hart filtern, aber merken falls None:
+        if m121 is None:
+            FAIL["mom121_nan"] += 1
+
+        # Ab hier für die übrigen Berechnungen auf DAYS_WIN kürzen
+        df = df_full.dropna(subset=["Close", "High", "Low"])
         df = df[-days:]
         if len(df) < days:
             if VERBOSE: print(f"{ticker}: zu wenige Tage ({len(df)}/{days}).")
@@ -158,7 +201,7 @@ def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
             FAIL["gap"] += 1
             return None
 
-        # --- Regression auf Log-Preisen ---
+        # --- Regression auf Log-Preisen (DAYS_WIN) ---
         df = df.copy()
         df["LogPrice"] = np.log(_as_series(df["Close"], "Close"))
         df["Day"] = np.arange(len(df), dtype=float)
@@ -169,7 +212,7 @@ def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
         reg = LinearRegression().fit(X, y)
         slope = float(reg.coef_[0][0])
         r2 = float(reg.score(X, y))
-        score = slope * r2
+        score_lin = slope * r2
 
         # --- ATR (Average True Range, 14) ---
         df["H-L"]  = df["High"] - df["Low"]
@@ -194,7 +237,8 @@ def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
             "ticker": ticker,
             "slope": round(slope, 6),
             "r2": round(r2, 4),
-            "score": round(score, 6),
+            "score_lin": round(score_lin, 6),
+            "mom_12_1": round(m121, 4) if m121 is not None else np.nan,
             "stop_loss_pct": round(stop_loss_pct, 2) if stop_loss_pct is not None else None,
             "volatility": round(vol_annual, 4) if vol_annual is not None else None
         }
@@ -246,6 +290,17 @@ def main():
         return
 
     df = pd.DataFrame(results)
+
+    # --- Kombi-Score: slope*r2 und 12-1 Momentum als Ranks zusammenführen ---
+    df["rank_lin"]  = df["score_lin"].rank(pct=True)
+    df["rank_m121"] = df["mom_12_1"].rank(pct=True)
+
+    # Fallback: wenn 12-1 fehlt (NaN), nimm den lin-Rank
+    df["rank_m121"] = df["rank_m121"].fillna(df["rank_lin"])
+
+    # Kombi (Gewichte anpassbar)
+    df["score"] = 0.5 * df["rank_lin"] + 0.5 * df["rank_m121"]
+
     top_8 = df.sort_values(by="score", ascending=False).head(8).reset_index(drop=True)
 
     # Inverse-Volatilitäts-Allokation
@@ -256,10 +311,17 @@ def main():
     else:
         top_8["allocation_pct"] = ((inv_vols / total_inv) * 100).round(2)
 
-    print("\nTop 8 Momentum-Aktien (Clenow + Filter):\n")
-    print(top_8)
+    # Ausgabe
+    cols_order = ["ticker", "score", "score_lin", "mom_12_1", "slope", "r2",
+                  "volatility", "allocation_pct", "stop_loss_pct"]
+    existing = [c for c in cols_order if c in top_8.columns]
+    print("\nTop 8 Momentum-Aktien (Kombi-Score + Filter):\n")
+    print(top_8[existing])
 
     print("\nFilter-Statistik:", dict(FAIL))
+
+    # Optional: CSV-Export
+    # top_8.to_csv("top8_momentum_plus.csv", index=False)
 
     print("\nStrategiehinweise")
     print("------------------")
