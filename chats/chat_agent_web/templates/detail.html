@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat-Detailansicht</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 2rem;
+        }
+        h1 {
+            color: #333;
+        }
+        .meta {
+            font-size: 0.9rem;
+            color: #666;
+            margin-bottom: 1rem;
+        }
+        .inhalt {
+            white-space: pre-wrap;
+            border-top: 1px solid #ccc;
+            padding-top: 1rem;
+        }
+        a {
+            display: inline-block;
+            margin-top: 1rem;
+            text-decoration: none;
+            color: #007BFF;
+        }
+    </style>
+</head>
+<body>
+    <h1>{{ chat.titel }}</h1>
+    <div class="meta">
+        <strong>Chat-ID:</strong> {{ chat.id }}<br>
+        <strong>Kategorien:</strong>
+        {% if chat.kategorien %}
+            {{ chat.kategorien | join(', ') }}
+        {% else %}
+            Keine
+        {% endif %}
+        <br>
+        <strong>Zusammenfassung:</strong> {{ chat.zusammenfassung }}
+    </div>
+    <div class="inhalt">
+        {{ chat.inhalt }}
+    </div>
+    <a href="/">Zurück zur Suche</a>
+</body>
+</html>

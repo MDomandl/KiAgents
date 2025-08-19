@@ -4,7 +4,7 @@ from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from agent.kategorisieren import generiere_kategorievorschlag, extrahiere_kategorien_und_relevanz, hole_kategorien, braucht_llm_kategorisierung
 from agent.zusammenfassen import generiere_zusammenfassung, get_chat_text
-from agent.db_writer import verbinde_mit_datenbank, insert_kategorien, insert_update_chats
+from agent.db_writer import verbinde_mit_datenbank, insert_kategorien, insert_update_chats, speichere_chat_nachrichten
 from datetime import datetime
 from agent.nutzerfreigabe import frage_benutzer
 
@@ -48,7 +48,8 @@ def fuehre_tasks_aus():
                 print(f"🔎 Manuelle Kategorie erkannt: {manuelle_kategorie}")
 
         zusammenfassung = "[Noch keine LLM-Zusammenfassung]"
-        insert_update_chats(chat_id, titel, erstellt_am, letzte_aenderung, message_count, chat_link, zusammenfassung, cursor)
+        chat_db_id = insert_update_chats(chat_id, titel, erstellt_am, letzte_aenderung, message_count, chat_link, zusammenfassung, cursor)
+        speichere_chat_nachrichten(chat_db_id, messages, cursor)
         cursor.execute("SELECT id FROM chats WHERE chat_id=%s", (chat_id,))
         result = cursor.fetchone()
         if not result:

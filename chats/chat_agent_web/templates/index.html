@@ -1,28 +1,66 @@
 <!DOCTYPE html>
-<html>
+<html lang="de">
 <head>
-    <title>Chat-Agent Suche</title>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
+    <title>Chat-Suche</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 2rem;
+        }
+        h1 {
+            color: #333;
+        }
+        form {
+            margin-bottom: 2rem;
+        }
+        input[type="text"] {
+            width: 60%;
+            padding: 0.5rem;
+            font-size: 1rem;
+        }
+        input[type="submit"] {
+            padding: 0.5rem 1rem;
+            font-size: 1rem;
+            margin-left: 0.5rem;
+        }
+        .result {
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            border: 1px solid #ccc;
+            border-radius: 0.5rem;
+        }
+        .score {
+            color: #666;
+            font-size: 0.9rem;
+        }
+    </style>
 </head>
 <body>
-    <h1>🔍 Chat-Agent Suche</h1>
-    <form method="POST">
-        <input type="text" name="query" placeholder="Suchbegriff..." required>
-        <button type="submit">Suchen</button>
+    <h1>Chat-Suche</h1>
+    <form method="post">
+        <input type="text" name="query" placeholder="Suchbegriff eingeben..." value="{{ query }}">
+        <input type="submit" value="Suchen">
     </form>
 
-    {% if results %}
+    {% if suchergebnisse %}
         <h2>Ergebnisse:</h2>
-        <ul>
-            {% for row in results %}
-                <li>
-                    <strong>{{ row.titel }}</strong><br>
-                    Relevanz: {{ row.relevanz }}<br>
-                  Kategorie(n): {{ row.kategorien or '–' }}<br>
-                    <em>{{ row.zusammenfassung or 'Keine Zusammenfassung vorhanden' }}</em>
-                </li>
-            {% endfor %}
-        </ul>
+        {% for eintrag in suchergebnisse %}
+            <div class="result">
+                <strong>{{ eintrag['titel'] }}</strong><br>
+                <div class="score">
+                    Relevanz: {{ '{:.3f}'.format(eintrag['gesamt_relevanz']) }}
+                    {% if eintrag.get('embedding_relevanz') is not none %}
+                        (Embedding: {{ '{:.3f}'.format(eintrag['embedding_relevanz']) }},
+                        Keyword-Bonus: {{ '{:.3f}'.format(eintrag['keyword_bonus']) }})
+                    {% endif %}
+                </div>
+                <p>{{ eintrag['zusammenfassung'] }}</p>
+                <a href="/chat/{{ eintrag['id'] }}">Details anzeigen</a>
+            </div>
+        {% endfor %}
+    {% elif query %}
+        <p>Keine passenden Ergebnisse gefunden.</p>
     {% endif %}
 </body>
 </html>

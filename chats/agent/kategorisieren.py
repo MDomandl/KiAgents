@@ -26,7 +26,7 @@ def generiere_kategorievorschlag(text, kategorien_liste):
         f"\nBitte keine Zeile mit N/A ausgeben"
     )
     result = subprocess.run(["ollama", "run", "llama3", prompt],
-                            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="ignore")
+                            capture_output=True, text=True, timeout=90, encoding="utf-8", errors="ignore")
     return result.stdout.strip()
 
 def extrahiere_kategorien_und_relevanz(text, kategorien_liste):

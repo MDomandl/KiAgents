@@ -1,0 +1,17 @@
+# Kernpakete
+langchain
+langchain-community
+chromadb
+
+# Embedding-Modelle
+openai
+transformers
+sentence-transformers
+
+# Sonstige nützliche Tools
+tiktoken
+python-dotenv
+
+# Datenbank und Web
+pymysql
+flask
