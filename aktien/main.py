@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from sklearn.linear_model import LinearRegression
 from collections import Counter
-
+from datetime import datetime
+from typing import Optional
 
 # =====================
 # Konfiguration
 # =====================
-ADJUSTED = True           # Bereinigte Kurse (Splits/Dividenden) verwenden
-PERIOD   = "400d"         # Längerer Zeitraum, damit 12-1 Momentum (≈252 Handelstage) sicher berechnet werden kann
-DAYS_WIN = 100            # Fenster für die lineare Trend-Auswertung
-GAP_TH   = 0.18           # Max. erlaubtes Tagesgap (18%)
-ADV_MIN_DOLLARS = 2_000_000  # Mindestdurchschnittsumsatz (Close*Volume über 20 Tage) in USD/EUR
-VERBOSE  = False          # Mehr Diagnoseausgaben
+ADJUSTED = True              # Bereinigte Kurse (Splits/Dividenden)
+PERIOD   = "400d"            # Für 12-1 Momentum ausreichend lang
+DAYS_WIN = 100               # Fenster für OLS-Trend/ATR/Vol
+GAP_TH   = 0.18              # Max. Tagesgap
+ADV_MIN_DOLLARS = 2_000_000  # Mindestdurchschnittsumsatz (Close*Volume, 20d)
 
-FAIL = Counter()          # Zähler, warum Titel rausfallen
+TOP_K    = 8                 # Zielanzahl Titel
+BUFFER_K = 12                # Turnover-Puffer: bestehende Titel bleiben bis Rang <= BUFFER_K
+FORCE_REBALANCE = False      # Unabhängig vom Monat neu gewichten
+SAVE_DIR = Path(".")         # Ausgabeordner (relative Pfade)
+VERBOSE  = False
 
+FAIL = Counter()             # Zähler, warum Titel rausfallen
 
 # =====================
 # Hilfsfunktionen
 # =====================
-def _as_series(x, name="Close"):
-    """Akzeptiert Series oder 1-Spalten-DataFrame und gibt garantiert eine Series zurück."""
+def _as_series(x, name="Close") -> pd.Series:
     if isinstance(x, pd.Series):
         return x
     if isinstance(x, pd.DataFrame):
@@ -33,29 +39,21 @@ def _as_series(x, name="Close"):
             return x.iloc[:, 0]
     return pd.Series(x, name=name)
 
-
-def ensure_ohlc(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
-    """Normalisiert ein von yfinance geliefertes DataFrame auf Spalten: Open, High, Low, Close, Volume."""
+def ensure_ohlc(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
         return None
 
     # MultiIndex flachziehen (z. B. wenn mehrere Ticker als Spaltenebene geliefert werden)
     if isinstance(df.columns, pd.MultiIndex):
-        # Falls die unterste Ebene die Ticker enthält, wähle den passenden Teilbaum
         if ticker in df.columns.get_level_values(-1):
             df = df.xs(ticker, axis=1, level=-1)
         else:
-            # ansonsten erste Ebene nehmen (Open/High/Low/Close/Volume)
             df.columns = df.columns.get_level_values(0)
 
     cols = set(df.columns)
-
-    # Close aus Adj Close ableiten, falls nötig
     if "Close" not in cols and "Adj Close" in cols:
         df["Close"] = df["Adj Close"]
         cols = set(df.columns)
-
-    # High/Low notfalls aus Close füllen (damit Pipeline weiterläuft; ATR wird dann konservativ klein)
     if "High" not in cols and "Close" in cols:
         df["High"] = df["Close"]
     if "Low" not in cols and "Close" in cols:
@@ -64,29 +62,23 @@ def ensure_ohlc(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
     if not {"Close", "High", "Low"}.issubset(df.columns):
         return None
 
-    # Für spätere Debugs den Ticker mitschreiben (optional)
     df.attrs["_ticker"] = ticker
     return df
 
-
-def download_ohlc(ticker: str, period: str = PERIOD, adjusted: bool = ADJUSTED) -> pd.DataFrame | None:
-    """Robuster Download mit Normalisierung und kleinem Fallback."""
+def download_ohlc(ticker: str, period: str = PERIOD, adjusted: bool = ADJUSTED) -> Optional[pd.DataFrame]:
     df = yf.download(ticker, period=period, interval="1d",
                      progress=False, auto_adjust=adjusted, threads=False)
     df = ensure_ohlc(df, ticker)
     if df is not None:
         return df
 
-    # Fallback (zur Sicherheit): nochmal mit auto_adjust=True laden
+    # Fallback (zur Sicherheit): nochmals mit auto_adjust=True
     df = yf.download(ticker, period=period, interval="1d",
                      progress=False, auto_adjust=True, threads=False)
     return ensure_ohlc(df, ticker)
 
-
-def kein_großes_gap_series(series, threshold: float = GAP_TH) -> tuple[bool, float | None]:
-    """Prüft, ob das maximale Tagesgap (abs. prozentuale Änderung) unterhalb threshold liegt.
-    Rückgabe: (ok, max_gap)
-    """
+def kein_großes_gap_series(series, threshold: float = GAP_TH):
+    """Rückgabe: (ok: bool, max_gap: float|None)"""
     s = _as_series(series, "Close").dropna()
     if s.empty:
         return False, None
@@ -96,22 +88,16 @@ def kein_großes_gap_series(series, threshold: float = GAP_TH) -> tuple[bool, fl
     mg = float(gaps.max())
     return (mg < threshold), mg
 
-
-def avg_dollar_volume(df: pd.DataFrame, win: int = 20) -> float | None:
-    """Durchschnittlicher Tagesumsatz: Close * Volume (rollierend)."""
+def avg_dollar_volume(df: pd.DataFrame, win: int = 20) -> Optional[float]:
     if "Close" not in df.columns or "Volume" not in df.columns:
         return None
-    ser = (_as_series(df["Close"], "Close") * _as_series(df["Volume"], "Volume")).rolling(win).mean()
-    ser = ser.dropna()
+    ser = (_as_series(df["Close"], "Close") * _as_series(df["Volume"], "Volume")).rolling(win).mean().dropna()
     if ser.empty:
         return None
     return float(ser.iloc[-1])
 
-
-def mom_12_1(close: pd.Series) -> float | None:
-    """12-1 Momentum: Rendite der letzten 12 Monate ohne den letzten Monat.
-       ≈ c[t-21] / c[t-252] - 1
-    """
+def mom_12_1(close: pd.Series) -> Optional[float]:
+    """12-1 Momentum: Rendite der letzten 12 Monate ohne den letzten Monat."""
     c = _as_series(close, "Close").dropna()
     if len(c) < 252:
         return None
@@ -124,10 +110,6 @@ def mom_12_1(close: pd.Series) -> float | None:
     except Exception:
         return None
 
-
-# =====================
-# Markt-Filter
-# =====================
 def sp500_above_200dma() -> bool:
     df = yf.download("^GSPC", period="250d", interval="1d",
                      progress=False, auto_adjust=ADJUSTED, threads=False)
@@ -141,71 +123,59 @@ def sp500_above_200dma() -> bool:
         return False
 
     sma200 = close.rolling(200).mean().dropna()
-
     last_close = float(close.iloc[-1])
     last_sma   = float(sma200.iloc[-1])
 
     print(f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt {'über' if last_close>last_sma else 'unter'} 200DMA")
     return last_close > last_sma
 
-
 # =====================
-# Score-Berechnung pro Ticker
+# Signal- & Score-Berechnung
 # =====================
-def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
+def calculate_signals_for_ticker(ticker: str):
+    """Gibt dict mit Signalen/Features zurück oder None bei Ausschluss."""
     try:
         df_full = download_ohlc(ticker, period=PERIOD, adjusted=ADJUSTED)
         if df_full is None or df_full.empty:
-            if VERBOSE: print(f"{ticker}: keine OHLC-Daten.")
             FAIL["no_data"] += 1
             return None
 
-        # (a) Liquidität: 20-Tage Durchschnittsumsatz
+        # (a) Liquidität
         adv = avg_dollar_volume(df_full, 20)
         if adv is not None and adv < ADV_MIN_DOLLARS:
-            if VERBOSE: print(f"{ticker}: illiquide (ADV={adv:,.0f} < {ADV_MIN_DOLLARS:,.0f}).")
             FAIL["illiquid"] += 1
             return None
 
-        # (b) 12-1 Momentum auf dem langen Fenster (df_full)
+        # (b) 12-1 Momentum
         m121 = mom_12_1(df_full["Close"])
-        # Nicht hart filtern, aber merken falls None:
         if m121 is None:
             FAIL["mom121_nan"] += 1
 
-        # Ab hier für die übrigen Berechnungen auf DAYS_WIN kürzen
+        # Kürzen auf Auswertefenster
         df = df_full.dropna(subset=["Close", "High", "Low"])
-        df = df[-days:]
-        if len(df) < days:
-            if VERBOSE: print(f"{ticker}: zu wenige Tage ({len(df)}/{days}).")
+        df = df[-DAYS_WIN:]
+        if len(df) < DAYS_WIN:
             FAIL["too_few_days"] += 1
             return None
 
-        # Filter 1: über 100-Tage-SMA?
+        # Filter 1: über 100er SMA?
         close = _as_series(df["Close"], "Close").dropna()
         sma100 = close.rolling(100).mean().dropna()
-        if sma100.empty:
-            FAIL["sma_nan"] += 1
-            return None
-
-        if not (float(close.iloc[-1]) > float(sma100.iloc[-1])):
-            if VERBOSE: print(f"{ticker}: unter 100-Tage-Linie ❌")
+        if sma100.empty or not (float(close.iloc[-1]) > float(sma100.iloc[-1])):
             FAIL["under_sma"] += 1
             return None
 
-        # Filter 2: keine großen Gaps (auf bereinigter Serie, falls vorhanden)
+        # Filter 2: keine großen Gaps (bereinigte Serie bevorzugen)
         series_for_gap = df["Adj Close"] if "Adj Close" in df.columns else close
         ok_gap, max_gap = kein_großes_gap_series(series_for_gap, threshold=GAP_TH)
         if not ok_gap:
-            if VERBOSE: print(f"{ticker}: großes Gap {max_gap:.2%} ❌")
             FAIL["gap"] += 1
             return None
 
-        # --- Regression auf Log-Preisen (DAYS_WIN) ---
+        # Trend (OLS auf Log-Preisen)
         df = df.copy()
         df["LogPrice"] = np.log(_as_series(df["Close"], "Close"))
         df["Day"] = np.arange(len(df), dtype=float)
-
         X = df["Day"].values.reshape(-1, 1)
         y = df["LogPrice"].values.reshape(-1, 1)
 
@@ -214,14 +184,13 @@ def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
         r2 = float(reg.score(X, y))
         score_lin = slope * r2
 
-        # --- ATR (Average True Range, 14) ---
+        # ATR(14)
         df["H-L"]  = df["High"] - df["Low"]
         df["H-PC"] = (df["High"] - df["Close"].shift(1)).abs()
         df["L-PC"] = (df["Low"]  - df["Close"].shift(1)).abs()
         df["TR"]   = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
         atr_series = df["TR"].rolling(window=14).mean().dropna()
         if atr_series.empty:
-            if VERBOSE: print(f"{ticker}: ATR nicht berechenbar (zu wenige Zeilen).")
             FAIL["atr_nan"] += 1
             return None
         atr = float(atr_series.iloc[-1])
@@ -229,31 +198,24 @@ def calculate_clenow_score(ticker: str, days: int = DAYS_WIN):
         last_close = float(close.iloc[-1])
         stop_loss_pct = (3 * atr / last_close) * 100 if last_close != 0 else None
 
-        # --- Historische Volatilität ---
+        # Historische Volatilität
         log_ret = np.log(close / close.shift(1)).dropna()
         vol_annual = float(log_ret.std() * np.sqrt(252)) if not log_ret.empty else None
 
         return {
             "ticker": ticker,
-            "slope": round(slope, 6),
-            "r2": round(r2, 4),
             "score_lin": round(score_lin, 6),
             "mom_12_1": round(m121, 4) if m121 is not None else np.nan,
-            "stop_loss_pct": round(stop_loss_pct, 2) if stop_loss_pct is not None else None,
-            "volatility": round(vol_annual, 4) if vol_annual is not None else None
+            "slope": round(slope, 6),
+            "r2": round(r2, 4),
+            "volatility": round(vol_annual, 4) if vol_annual is not None else None,
+            "stop_loss_pct": round(stop_loss_pct, 2) if stop_loss_pct is not None else None
         }
-
-    except Exception as e:
-        if VERBOSE:
-            print(f"{ticker}: Fehler [{e}]")
+    except Exception:
         FAIL["exception"] += 1
         return None
 
-
-# =====================
-# Ticker-Liste laden
-# =====================
-def load_tickers(path: str = "sp500_tickers.txt") -> list[str]:
+def load_tickers(path: str = "sp500_tickers.txt") -> list:
     try:
         with open(path, "r", encoding="utf-8") as f:
             tickers = [line.strip() for line in f if line.strip()]
@@ -264,11 +226,73 @@ def load_tickers(path: str = "sp500_tickers.txt") -> list[str]:
         print(f"Warnung: Konnte '{path}' nicht laden ({e}). Nutze Fallback (AAPL, MSFT, NVDA).")
         return ["AAPL", "MSFT", "NVDA"]
 
+# =====================
+# Turnover-Puffer & Rebalancing
+# =====================
+def current_month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+def read_prev_positions(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=["as_of", "ticker", "allocation_pct", "rank", "score"])
+    df = pd.read_csv(path)
+    for col in ["as_of", "ticker", "allocation_pct", "rank", "score"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+def select_with_buffer(ranked_df: pd.DataFrame, prev_positions: pd.DataFrame,
+                       top_k: int = TOP_K, buffer_k: int = BUFFER_K) -> pd.DataFrame:
+    """Behält alte Titel mit Rang <= buffer_k, füllt Rest mit besten neuen bis top_k."""
+    keep = []
+    if not prev_positions.empty:
+        prev_tickers = set(prev_positions["ticker"].astype(str))
+        sub = ranked_df[ranked_df["ticker"].isin(prev_tickers)]
+        keep = sub[sub["rank"] <= buffer_k].sort_values("rank").head(top_k)
+
+    need = top_k - len(keep)
+    filler = ranked_df[~ranked_df["ticker"].isin(keep["ticker"] if len(keep) else [])]
+    filler = filler.sort_values("rank").head(max(0, need))
+
+    sel = pd.concat([keep, filler], ignore_index=True)
+    sel = sel.sort_values("rank").head(top_k).reset_index(drop=True)
+    return sel
+
+def inverse_vol_allocation(df_sel: pd.DataFrame) -> pd.Series:
+    vols = df_sel["volatility"].replace(0, np.nan)
+    inv = 1.0 / vols
+    total = float(inv.sum())
+    if total == 0 or np.isnan(total):
+        return pd.Series([np.nan]*len(df_sel), index=df_sel.index)
+    return (inv / total * 100).round(2)
+
+def should_rebalance(prev_positions_path: Path) -> bool:
+    if FORCE_REBALANCE:
+        return True
+    if not prev_positions_path.exists():
+        return True
+    df_prev = pd.read_csv(prev_positions_path)
+    if df_prev.empty:
+        return True
+    last_date = pd.to_datetime(df_prev["as_of"].max(), errors="coerce")
+    if pd.isna(last_date):
+        return True
+    return last_date.strftime("%Y-%m") != current_month_key()
+
+def append_csv(path: Path, df: pd.DataFrame):
+    header = not path.exists()
+    df.to_csv(path, mode="a", header=header, index=False, encoding="utf-8")
 
 # =====================
 # Hauptprogramm
 # =====================
 def main():
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    positions_path = SAVE_DIR / "portfolio_positions.csv"
+    rankings_log   = SAVE_DIR / "rankings_log.csv"
+    runs_log       = SAVE_DIR / "runs_log.csv"
+    top8_log       = SAVE_DIR / "top8_log.csv"
+
     tickers = load_tickers()
     print(f"Starte Bewertung ({len(tickers)} Ticker)...")
 
@@ -276,59 +300,83 @@ def main():
         print("⚠️  Abbruch: S&P 500 unter 200-Tage-Linie (kein Long-Markt).")
         return
 
-    results = []
+    # Signale sammeln
+    rows = []
     for i, t in enumerate(tickers, 1):
         print(f"[{i}/{len(tickers)}] {t} ...")
-        res = calculate_clenow_score(t)
-        if res:
-            results.append(res)
+        sig = calculate_signals_for_ticker(t)
+        if sig:
+            rows.append(sig)
 
-    if not results:
+    if not rows:
         print("⚠️  Keine Ergebnisse nach Filtern/Berechnung.")
         if FAIL:
             print("Filter-Statistik:", dict(FAIL))
+        run_row = pd.DataFrame([{
+            "as_of": pd.Timestamp.now().strftime("%Y-%m-%d"),
+            "adjusted": ADJUSTED, "period": PERIOD, "days_win": DAYS_WIN,
+            "gap_th": GAP_TH, "adv_min": ADV_MIN_DOLLARS,
+            "top_k": TOP_K, "buffer_k": BUFFER_K,
+            "num_universe": len(tickers),
+            "num_pass": 0, "fail_counts": dict(FAIL)
+        }])
+        append_csv(runs_log, run_row)
         return
 
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(rows)
 
-    # --- Kombi-Score: slope*r2 und 12-1 Momentum als Ranks zusammenführen ---
+    # Kombi-Score (Ranks)
     df["rank_lin"]  = df["score_lin"].rank(pct=True)
-    df["rank_m121"] = df["mom_12_1"].rank(pct=True)
+    df["rank_m121"] = df["mom_12_1"].rank(pct=True).fillna(df["rank_lin"])
+    df["score"] = 0.5*df["rank_lin"] + 0.5*df["rank_m121"]
 
-    # Fallback: wenn 12-1 fehlt (NaN), nimm den lin-Rank
-    df["rank_m121"] = df["rank_m121"].fillna(df["rank_lin"])
+    # Gesamtrang (1=best)
+    df = df.sort_values("score", ascending=False).reset_index(drop=True)
+    df["rank"] = np.arange(1, len(df)+1)
 
-    # Kombi (Gewichte anpassbar)
-    df["score"] = 0.5 * df["rank_lin"] + 0.5 * df["rank_m121"]
+    # Rankings-Log (vollständig)
+    full_rank_log = df.copy()
+    full_rank_log.insert(0, "as_of", pd.Timestamp.now().strftime("%Y-%m-%d"))
+    append_csv(rankings_log, full_rank_log)
 
-    top_8 = df.sort_values(by="score", ascending=False).head(8).reset_index(drop=True)
+    # Turnover-Puffer anwenden / monatlich rebalancen
+    prev_positions = read_prev_positions(positions_path)
+    rebalance_now = should_rebalance(positions_path)
+    if not rebalance_now:
+        print("ℹ️  Diesen Monat bereits rebalanced – nutze bestehende Positionen (FORCE_REBALANCE=True zum Erzwingen).")
+        print(prev_positions)
+        return
 
-    # Inverse-Volatilitäts-Allokation
-    inv_vols = 1.0 / top_8["volatility"].replace(0, np.nan)
-    total_inv = float(inv_vols.sum())
-    if total_inv == 0 or np.isnan(total_inv):
-        top_8["allocation_pct"] = np.nan
-    else:
-        top_8["allocation_pct"] = ((inv_vols / total_inv) * 100).round(2)
+    sel = select_with_buffer(df[["ticker", "rank", "score", "volatility", "stop_loss_pct"]],
+                             prev_positions, TOP_K, BUFFER_K)
+
+    # Allocation
+    sel["allocation_pct"] = inverse_vol_allocation(sel)
+    sel.insert(0, "as_of", pd.Timestamp.now().strftime("%Y-%m-%d"))
 
     # Ausgabe
-    cols_order = ["ticker", "score", "score_lin", "mom_12_1", "slope", "r2",
-                  "volatility", "allocation_pct", "stop_loss_pct"]
-    existing = [c for c in cols_order if c in top_8.columns]
-    print("\nTop 8 Momentum-Aktien (Kombi-Score + Filter):\n")
-    print(top_8[existing])
+    print("\nNeues Portfolio (Turnover-Puffer aktiv):\n")
+    print(sel)
+
+    # Logs schreiben
+    append_csv(top8_log, sel)
+
+    run_row = pd.DataFrame([{
+        "as_of": pd.Timestamp.now().strftime("%Y-%m-%d"),
+        "adjusted": ADJUSTED, "period": PERIOD, "days_win": DAYS_WIN,
+        "gap_th": GAP_TH, "adv_min": ADV_MIN_DOLLARS,
+        "top_k": TOP_K, "buffer_k": BUFFER_K,
+        "num_universe": len(tickers),
+        "num_pass": len(df),
+        "fail_counts": dict(FAIL)
+    }])
+    append_csv(runs_log, run_row)
+
+    # Portfolio-Status aktualisieren (überschreiben = aktueller Bestand)
+    sel[["as_of","ticker","allocation_pct","rank","score"]].to_csv(positions_path, index=False, encoding="utf-8")
 
     print("\nFilter-Statistik:", dict(FAIL))
-
-    # Optional: CSV-Export
-    # top_8.to_csv("top8_momentum_plus.csv", index=False)
-
-    print("\nStrategiehinweise")
-    print("------------------")
-    print("• Neubewertung: Jeden Mittwoch. Aktien, die nicht mehr führend sind, werden verkauft und ersetzt.")
-    print("• Stop-Loss-Anpassung: Ebenfalls mittwochs (3× ATR).")
-    print("• Rebalancing: Alle 6 Monate Allokation prüfen und ggf. anpassen.")
-
+    print(f"\nGespeichert unter:\n  - {positions_path}\n  - {top8_log}\n  - {rankings_log}\n  - {runs_log}")
 
 if __name__ == "__main__":
     main()
