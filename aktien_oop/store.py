@@ -57,6 +57,7 @@ class PortfolioStore:
         """
         payload = {
             "as_of": pd.Timestamp.now().isoformat(),
+            "rebalance_frequency": meta.get("rebalance_frequency"),  # <- weekly / monthly
             # feste (optionale) Meta-Felder:
             "universe_size": meta.get("universe_size"),
             "top_k": meta.get("top_k"),

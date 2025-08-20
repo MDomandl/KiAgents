@@ -4,6 +4,7 @@ from pathlib import Path
 import argparse, logging, json
 from typing import Optional
 
+
 # -----------------------
 # Aliase (falls genutzt)
 # -----------------------
@@ -58,11 +59,16 @@ class Config:
     days_win: int = 100
     gap_th: float = 0.08
     adv_min_dollars: float = 5_000_000
-    top_k: int = 8
-    buffer_k: int = 4
-    force_rebalance: bool = False
-    verbose: bool = False
+    top_k: int = 10   # Anzahl Aktien im Portfolio
+    buffer_k: int = 4  # Turnover-Puffer
+    force_rebalance: bool = False # via CLI überschreibbar
+    rebalance_frequency: str = "weekly"  # "monthly" oder "weekly"
+    verbose: bool = False # via CLI überschreibbar
     lib_debug: bool = False
+
+    @property
+    def force(self) -> bool:
+        return self.force_rebalance
 
     # 🔽 DEFAULTS für Sektorsteuerung
     max_per_sector: int | None = 2                 # Global: max. 2 Titel je Sektor (None = aus)

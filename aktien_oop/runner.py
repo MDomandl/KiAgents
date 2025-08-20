@@ -63,6 +63,15 @@ class Runner:
         return (pd.Timestamp.now().strftime("%Y-%m")
                 != pd.Timestamp(last_dt).strftime("%Y-%m"))
 
+    @staticmethod
+    def _same_period(a: pd.Timestamp, b: pd.Timestamp, freq: str) -> bool:
+        """Vergleicht zwei Zeitpunkte auf gleiche Woche/Monat (abhängig von freq)."""
+        if freq == "weekly":
+            # Woche mit Montags-Anker ist stabiler über Zeitzonen
+            return a.to_period("W-MON") == b.to_period("W-MON")
+        # Default: monatlich
+        return a.to_period("M") == b.to_period("M")
+
     def _print_existing_positions(self) -> None:
         pos = self.store.load_positions()
         if pos.empty:
@@ -95,13 +104,18 @@ class Runner:
     # ---------------------------
     def run(self) -> None:
         setup_logging(self.cfg.verbose, lib_debug=self.cfg.lib_debug, log_file=self.cfg.save_dir / "run.log")
+        now = pd.Timestamp.now()
         last_dt = self.store.last_rebalance_time()
         logging.info("Force=%s, last_rebalance=%s", self.cfg.force_rebalance, last_dt)
 
-        if not self._should_rebalance(last_dt):
-            logging.info("Diesen Monat bereits rebalanced – bestehende Positionen bleiben. (--force für sofort)")
-            self._print_existing_positions()
-            return
+        if (not self.cfg.force_rebalance) and last_dt is not None:
+            if self._same_period(last_dt, now, self.cfg.rebalance_frequency):
+                self._print_existing_positions()
+                logging.info(
+                    "Bereits rebalanced in dieser %s – (--force/--force-rebalance) für sofort",
+                    "Woche" if self.cfg.rebalance_frequency == "weekly" else "Monat"
+                )
+                return
 
         tickers = self.load_tickers()
         sector_map = self._load_sector_map()
