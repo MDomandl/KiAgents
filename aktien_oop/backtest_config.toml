@@ -1,0 +1,24 @@
+# --- Daten & Pfade ---
+tickers_file   = "aktien_oop/sp500_tickers.txt"
+sector_meta    = "aktien_oop/sp500_meta.csv"   # optional; leer lassen, wenn nicht vorhanden
+save_dir       = "aktien_oop"
+
+# --- Zeitraum & Frequenz ---
+start          = "=2023-05-01"
+end            = "2025-08-16"
+frequency      = "monthly"   # "monthly" oder "weekly"
+
+# --- Portfolio-Logik ---
+top_k          = 12           # Anzahl Aktien im Portfolio
+buffer_k       = 4           # Turnover-Puffer
+max_per_sector = 5           # 0 oder negativ = deaktiviert
+
+# --- Kostenmodell (Basispunkte) ---
+cost_bps       = 10.0
+slippage_bps   = 5.0
+
+# --- Mindesthistorie in Tagen (für Signale) ---
+min_history_days = 260
+
+# --- Logging ---
+verbose        = true
