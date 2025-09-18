@@ -14,8 +14,8 @@ buffer_k       = 4           # Turnover-Puffer
 max_per_sector = 5           # 0 oder negativ = deaktiviert
 
 # --- Kostenmodell (Basispunkte) ---
-cost_bps       = 10.0
-slippage_bps   = 5.0
+cost_bps       = 0
+slippage_bps   = 7.0
 
 # --- Mindesthistorie in Tagen (für Signale) ---
 min_history_days = 260

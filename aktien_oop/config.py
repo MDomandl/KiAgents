@@ -66,6 +66,8 @@ class Config:
     verbose: bool = False # via CLI überschreibbar
     lib_debug: bool = False
 
+    show_plots: bool = False
+
     @property
     def force(self) -> bool:
         return self.force_rebalance
@@ -82,7 +84,8 @@ class Config:
         ap.add_argument("--save-dir", dest="save_dir", type=Path)
         ap.add_argument("--verbose", action="store_true")
         ap.add_argument("--lib-debug", action="store_true")
-        ap.add_argument("--force", dest="force_rebalance", action="store_true")  # <—
+        ap.add_argument("--force", dest="force_rebalance", action="store_true")
+        ap.add_argument("--show-plots", action="store_true", help="Equity/Drawdown-Plots anzeigen")
         args = ap.parse_args()
         return Config(**{k: v for k, v in vars(args).items() if v is not None})
 
@@ -133,6 +136,7 @@ def parse_args() -> Config:
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--tickers", type=str, default=None)
     p.add_argument("--lib-debug", action="store_true")
+    p.add_argument("--show-plots", action="store_true", default=True)
 
     # 🔽 Sektor-Optionen (optional; überschreiben Defaults nur bei Angabe)
     p.add_argument("--sector-meta", type=str, default=None)
@@ -160,6 +164,7 @@ def parse_args() -> Config:
         verbose=a.verbose or defaults.verbose,
         tickers_file=Path(a.tickers) if a.tickers is not None else defaults.tickers_file,
         lib_debug=a.lib_debug or defaults.lib_debug,
+        show_plots=a.show_plots or defaults.show_plots,
 
         # 🔽 Defaults bleiben, bis CLI explizit überschreibt
         sector_meta_file=Path(a.sector_meta) if a.sector_meta is not None else defaults.sector_meta_file,
