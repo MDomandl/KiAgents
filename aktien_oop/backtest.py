@@ -44,6 +44,23 @@ class BTConfig:
     slippage_bps: float             # Slippage (bps) pro Turnover
     min_history_days: int = 260     # Mindesthistorie je Ticker
 
+    use_equal_weight: bool = False
+    friction_eps: float = 0.0
+    weight_round_step: float = 0.0
+    max_turnover_cap: float = 0.0
+    rebalance_every_n: int = 1
+    benchmark_ticker: Optional[str] = "SPY"
+
+    regime_use_filter: bool = False
+    regime_sma_days: int = 200  # z.B. 200 Kalendertage
+    regime_exposure_low: float = 0.50  # z.B. 50% Exposure bei "unter SMA"
+
+    vol_target_ann: Optional[float] = None  # z.B. 0.20 für 20% p.a.; None = aus
+    vol_lookback_days: int = 20  # Roll-Fenster (Handelstage) für Sigma
+
+    min_position_weight: float = 0.0
+    max_active_names: int = 0
+
     verbose: bool = False
 
 
@@ -110,7 +127,7 @@ def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
     if not cols:
         return pd.DataFrame()
 
-    return pd.concat(cols.values(), axis=1).sort_index()
+    return pd.concat(cols, axis=1).sort_index()
 
 
 
@@ -156,6 +173,8 @@ def compute_features(px: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     mom126 = px / px.shift(126) - 1.0
     mom252 = px / px.shift(252) - 1.0
 
+    mom12_1 = px.shift(21) / px.shift(252) - 1.0
+
     return {
         "px": px,
         "rets": rets,
@@ -164,6 +183,7 @@ def compute_features(px: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         "mom63": mom63,
         "mom126": mom126,
         "mom252": mom252,
+        "mom12_1": mom12_1,
     }
 
 
@@ -177,6 +197,7 @@ def score_universe(feat: Dict[str, pd.DataFrame],
         "mom63":  feat["mom63"].loc[:as_of, cols].iloc[-1],
         "mom126": feat["mom126"].loc[:as_of, cols].iloc[-1],
         "mom252": feat["mom252"].loc[:as_of, cols].iloc[-1],
+        "mom12_1": feat["mom12_1"].loc[:as_of, cols].iloc[-1],
         "sma100": feat["sma100"].loc[:as_of, cols].iloc[-1],
         "vol20":  feat["vol20"].loc[:as_of, cols].iloc[-1],
     }
@@ -199,7 +220,8 @@ def score_universe(feat: Dict[str, pd.DataFrame],
     r63 = xs_rank01(row["mom63"])
     r126 = xs_rank01(row["mom126"])
     r252 = xs_rank01(row["mom252"])
-    score = (0.4 * r63 + 0.3 * r126 + 0.3 * r252)
+    r12_1 = xs_rank01(row["mom12_1"])
+    score = (0.50 * r12_1 + 0.25 * r126 + 0.25 * r63)
 
     vol = row["vol20"]
 
@@ -209,11 +231,12 @@ def score_universe(feat: Dict[str, pd.DataFrame],
         "mom63": r63.values,
         "mom126": r126.values,
         "mom252": r252.values,
+        "mom12_1": r12_1.values,
         "volatility": vol.values,
         "gap": has_gap.reindex(score.index).fillna(False).values,
         "under_sma": under_sma.reindex(score.index).fillna(True).values,
     })
-    penalty = 0.10 * df["under_sma"].astype(int)  # 0.10 = 10%-Punkte Rank-Penalty
+    penalty = 0.15 * df["under_sma"].astype(int)  # 0.15 = 15%-Punkte Rank-Penalty
     df["score_adj"] = df["score"] - penalty
     df = df.sort_values("score_adj", ascending=False)
     df["rank"] = np.arange(1, len(df) + 1, dtype=int)
@@ -265,7 +288,17 @@ def inverse_vol_weights(sel: pd.DataFrame) -> pd.Series:
         v = pd.Series(1.0, index=sel.index)
     v = v.fillna(v.median())
     inv = 1.0 / v
-    return inv / inv.sum()
+    w = inv / inv.sum()
+    # WICHTIG: Index = Ticker
+    w.index = sel["ticker"].values
+    return w
+
+def build_weights(sel: pd.DataFrame, use_equal_weight: bool) -> pd.Series:
+    if use_equal_weight:
+        w = pd.Series(1.0 / len(sel), index=sel["ticker"].values)
+    else:
+        w = inverse_vol_weights(sel)
+    return w
 
 
 def calc_drawdown(equity: pd.Series) -> Tuple[float, pd.Timestamp, pd.Timestamp]:
@@ -298,6 +331,8 @@ class Backtester:
         # Index säubern und sortieren
         px.index = pd.to_datetime(px.index).tz_localize(None)
         px = px[~px.index.duplicated()].sort_index()
+        # Spalten normalisieren (MultiIndex → Ticker), dann str
+        px = _normalize_price_columns(px)
         # Spaltennamen als str (verhindert seltsame Joins)
         px.columns = px.columns.astype(str)
 
@@ -305,6 +340,33 @@ class Backtester:
             print("Keine Preisdaten geladen.")
             return
         feats = compute_features(px)
+
+        # --- Regime-Filter vorbereiten (optional) ---
+        regime_on = bool(getattr(self.cfg, "regime_use_filter", False))
+        bm_s = None
+        bm_sma = None
+        if regime_on:
+            bm_tk = self.cfg.benchmark_ticker or "SXR8.DE"
+            bm_px = download_close([bm_tk], self.cfg.start, self.cfg.end, verbose=False)
+            bm_px = _normalize_price_columns(bm_px)
+            if not bm_px.empty:
+                s = bm_px.iloc[:, 0].astype(float).dropna()
+                s.index = pd.to_datetime(s.index).tz_localize(None)
+                s = s[~s.index.duplicated()].sort_index()
+                # Zeitbasiertes Rolling: letzte N Kalendertage
+                N = int(self.cfg.regime_sma_days)
+                sma = s.rolling(window=f"{N}D").mean()
+                bm_s, bm_sma = s, sma
+            else:
+                regime_on = False
+
+        vt_on = bool(getattr(self.cfg, "vol_target_ann", None))
+        vt_exp = None
+        if vt_on and bm_s is not None:
+            bm_ret = bm_s.pct_change().replace([np.inf, -np.inf], np.nan)
+            roll = bm_ret.rolling(self.cfg.vol_lookback_days).std()
+            target_daily = float(self.cfg.vol_target_ann) / np.sqrt(252.0)
+            vt_exp = (target_daily / roll).clip(upper=1.0)  # nur runterregeln, nie hebeln
 
         # 2) Rebalance-Termine
         first_valid = px.index.min() + pd.Timedelta(days=self.cfg.min_history_days)
@@ -330,6 +392,39 @@ class Backtester:
 
         # 3) Backtest-Schleife
         for i, d in enumerate(rdates):
+            # Nächsten Stichtag gleich bestimmen
+            d_next = rdates[i + 1] if i + 1 < len(rdates) else pd.Timestamp(self.cfg.end)
+
+            # Nur jeden n-ten Termin handeln?
+            n = int(getattr(self.cfg, "rebalance_every_n", 1) or 1)
+            if n > 1 and (i % n) != 0:
+                # KEIN Reweighting: Kosten = 0, mit aktuellen Gewichten weiterlaufen
+                trade_cost = 0.0
+                equity_rows.append({"date": pd.Timestamp(d), "equity": equity_val})
+                if cur_holdings:
+                    ret_mask = (feats["rets"].index > d) & (feats["rets"].index <= d_next)
+                    rets_sub = feats["rets"].loc[ret_mask, cur_holdings].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    if not rets_sub.empty:
+                        w_ser = cur_weights.reindex(cur_holdings).fillna(0.0)
+                        for idx, r in rets_sub.dot(w_ser).items():
+                            equity_val *= (1.0 + float(r))
+                            equity_rows.append({"date": pd.Timestamp(idx), "equity": equity_val})
+
+                # Logs schreiben
+                if cur_holdings:
+                    tmp = pd.DataFrame({"ticker": cur_holdings})
+                    tmp["allocation_pct"] = (cur_weights.reindex(cur_holdings).values * 100.0).round(2)
+                    if secmap:
+                        tmp["sector"] = tmp["ticker"].map(secmap).fillna("UNKNOWN")
+                    tmp.insert(0, "as_of", d.strftime("%Y-%m-%d"))
+                    positions_log.append(tmp)
+
+                trades_log.append(
+                    {"date": d.strftime("%Y-%m-%d"), "turnover": 0.0, "trade_cost": 0.0, "enter": "", "exit": ""})
+                if self.cfg.verbose:
+                    print(f"{d.date()} [SKIP n={n}] turnover=0.000 cost=0.0000 eq={equity_val:.4f}")
+                continue
+
             # Universum mit genügend Historie
             valid_cols = []
             for t in px.columns:
@@ -346,53 +441,172 @@ class Backtester:
             filtered, filt_stats = apply_filters(rank_df)
 
             # Sektor-Limits
-            lim_df = enforce_sector_limits(filtered, secmap, self.cfg.max_per_sector, self.cfg.top_k)
+            # 1) Kandidaten: sector-capped, aber groß genug für den Buffer
+            cand_df = enforce_sector_limits(
+                filtered, secmap, self.cfg.max_per_sector, self.cfg.top_k + self.cfg.buffer_k
+            )
 
-            # Turnover-Puffer
-            target_list = turnover_buffer(lim_df.sort_values("rank"), cur_holdings, self.cfg.top_k, self.cfg.buffer_k)
-            sel = filtered.set_index("ticker").loc[target_list].reset_index()
+            # 2) Puffer anwenden: alte Titel behalten, falls Rang ≤ top_k + buffer_k
+            target_list = turnover_buffer(
+                cand_df.sort_values("rank"), cur_holdings, self.cfg.top_k, self.cfg.buffer_k
+            )
+
+            # 3) Final: genau die top_k aus den Kandidaten
+            sel = cand_df.set_index("ticker").loc[target_list].reset_index()
             sel = sel.sort_values("rank").reset_index(drop=True)
 
             # Gewichte
-            w = inverse_vol_weights(sel)
-            sel["allocation_pct"] = (w * 100.0).round(2)
+            w = build_weights(sel, self.cfg.use_equal_weight)
+            sel["allocation_pct"] = (w.reindex(sel["ticker"]).values * 100.0).round(2)
 
             # Trades / Turnover / Kosten
-            new_weights = w.copy()
+            new_weights = w.copy()  # ← garantiert gesetzt
             old_weights = cur_weights.copy()
 
-            # Indizes (Ticker) robust auf str zwingen
+            # optionales Runden aus der TOML (z. B. 0.02 = 2 %-Punkte)
+            step = float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0)
+            if step > 0:
+                new_weights = (new_weights / step).round() * step
+                s = float(new_weights.sum())
+                if s > 0:
+                    new_weights = new_weights / s
+
+            # Ticker-Index als str
             new_weights.index = new_weights.index.map(str)
             old_weights.index = old_weights.index.map(str)
 
-            # Vergleichsreindex nur über neue Ticker (symmetrisch reicht hier)
+            # Union beider Seiten (damit Verkäufe gezählt werden)
             union = new_weights.index.union(old_weights.index)
             new_sorted = new_weights.reindex(union, fill_value=0.0).sort_index()
             old_sorted = old_weights.reindex(union, fill_value=0.0).sort_index()
-            turnover = float((new_sorted - old_sorted).abs().sum())
+
+            # Delta & Turnover
+            delta = new_sorted - old_sorted
+            raw_turnover = float(delta.abs().sum())
+
+            # Friction: kleine Änderungen ignorieren (eps in Prozentpunkten)
+            eps = float(self.cfg.friction_eps or 0.0)
+            if eps > 0:
+                delta = delta.where(delta.abs() >= eps, 0.0)
+
+            turnover = float(delta.abs().sum())
+
+            # VOR 'eff_new = old_sorted + delta' – direkt nach Friction und vor dem Cap:
+            sell_zero = (new_sorted == 0) & (old_sorted > 0)
+            buy_pos = (new_sorted > old_sorted)
+            sell_pos = (new_sorted < old_sorted)
+
+            # Reihenfolge: zuerst 'sell_zero', dann übrige sells, dann buys – alles im Cap-Budget
+            budget = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            if budget > 0:
+                alloc = pd.Series(0.0, index=delta.index)
+
+                # 1) Null-Ziel-Verkäufe priorisieren
+                need = (-delta.where(sell_zero, 0.0)).abs()
+                take = need.copy()
+                if need.sum() > 0 and need.sum() > budget:
+                    take *= budget / need.sum()
+                alloc -= take
+                budget -= float(take.sum())
+
+                # 2) restliche Verkäufe
+                if budget > 1e-12:
+                    need = (-delta.where(sell_pos & ~sell_zero, 0.0)).abs()
+                    if need.sum() > 0:
+                        take = need * min(1.0, budget / need.sum())
+                        alloc -= take
+                        budget -= float(take.sum())
+
+                # 3) Käufe (vom Restbudget)
+                if budget > 1e-12:
+                    need = (delta.where(buy_pos, 0.0)).abs()
+                    if need.sum() > 0:
+                        take = need * min(1.0, budget / need.sum())
+                        alloc += take
+                        budget -= float(take.sum())
+
+                delta = alloc
+
+            # Soft-Cap (uniform) – nur für die Cap-Entscheidung berechnen
+            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            if cap > 0.0:
+                t_for_cap = float(delta.abs().sum())
+                if t_for_cap > cap:
+                    scale = cap / t_for_cap
+                    delta *= scale
+
+            # Effektive neue Gewichte + Renorm
+            eff_new = old_sorted + delta
+            if eff_new.sum() > 0:
+                eff_new = eff_new / eff_new.sum()
+
+            # 1) Mini-Positionen auf 0 setzen (Dust)
+            dust = float(getattr(self.cfg, "min_position_weight", 0.0) or 0.0)  # z.B. 0.01 = 1%-Punkt
+            if dust > 0:
+                eff_new = eff_new.where(eff_new >= dust, other=0.0)
+                s = float(eff_new.sum())
+                if s > 0:
+                    eff_new = eff_new / s
+
+            # 2) Max. aktive Titel begrenzen (z.B. = top_k)
+            max_names = int(getattr(self.cfg, "max_active_names", 0) or 0)
+            if max_names > 0 and (eff_new > 0).sum() > max_names:
+                keep = eff_new.sort_values(ascending=False).head(max_names).index
+                eff_new = eff_new.where(eff_new.index.isin(keep), other=0.0)
+                eff_new = eff_new / eff_new.sum()
+
+            # 3) Turnover/Kosten NACH der Finalisierung berechnen
+            # --- FINALER Cap-Guard nach Dust/Limit ---
+            delta_eff = eff_new - old_sorted
+            turnover = float(delta_eff.abs().sum())
+
+            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            if cap > 0.0 and turnover > cap:
+                scale = cap / turnover
+                eff_new = old_sorted + delta_eff * scale
+                # (optional) numerisch renormalisieren:
+                s = float(eff_new.sum())
+                if s > 0:
+                    eff_new = eff_new / s
+                # Turnover neu ermitteln – jetzt garantiert ≤ cap
+                delta_eff = eff_new - old_sorted
+                turnover = float(delta_eff.abs().sum())
+
+            # Kosten auf Basis des ***finalen*** Turnover
             trade_cost = turnover * (self.cfg.cost_bps + self.cfg.slippage_bps) / 10000.0
 
-            enter_list = [t for t in new_sorted.index if old_sorted.get(t, 0.0) == 0.0 and new_sorted[t] > 0]
-            exit_list = [t for t in old_sorted.index if old_sorted[t] > 0 and new_sorted.get(t, 0.0) == 0.0]
+            # Zustand setzen
+            cur_weights = eff_new[eff_new > 0].copy()
+            cur_holdings = cur_weights.index.tolist()
+            assert abs(cur_weights.sum() - 1.0) < 1e-9
+
+            # Enter/Exit-Listen aus effektiven Trades
+            # NEU: set-basierte Variante (typ-sicher)
+            prev_idx = old_sorted[old_sorted > 0.0].index
+            curr_idx = cur_weights[cur_weights > 0.0].index
+
+            enter_list = [t for t in curr_idx if t not in prev_idx]
+            exit_list = [t for t in prev_idx if t not in curr_idx]
+
+            # Positions-Log aus cur_weights bauen
+            sel = pd.DataFrame({"ticker": cur_holdings})
+            sel["allocation_pct"] = (cur_weights.reindex(cur_holdings).values * 100.0).round(2)
+            if secmap:
+                sel["sector"] = sel["ticker"].map(secmap).fillna("UNKNOWN")
 
             trades_log.append({
                 "date": d.strftime("%Y-%m-%d"),
                 "turnover": turnover,
                 "trade_cost": trade_cost,
-                "enter": ",".join([str(t) for t in new_weights.index if
-                                   float(old_weights.get(t, 0.0)) == 0.0 and float(new_weights.get(t, 0.0)) > 0.0]),
-                "exit": ",".join([str(t) for t in old_weights.index if
-                                  float(old_weights.get(t, 0.0)) > 0.0 and float(new_weights.get(t, 0.0)) == 0.0]),
+                "enter": ",".join(enter_list),
+                "exit": ",".join(exit_list),
             })
 
-            # Zustand setzen
-            cur_weights = w.copy()
-            assert abs(cur_weights.sum() - 1.0) < 1e-9
-            cur_holdings = sel["ticker"].tolist()
+            # (Optional) Debug
+            if self.cfg.verbose:
+                print(f"[FRICTION] raw_turnover={raw_turnover:.3f}  eff_turnover={turnover:.3f}  eps={eps:.3f}")
 
             # 3d) Performance bis zum nächsten Rebalance-Datum (exklusiv)
-            d_next = rdates[i + 1] if i + 1 < len(rdates) else pd.Timestamp(self.cfg.end)
-
             # exklusives Ende: alle Tage >= d und < d_next
             # (d, d_next] → Tage NACH dem Rebalance bis inkl. d_next
             ret_mask = (feats["rets"].index > d) & (feats["rets"].index <= d_next)
@@ -408,7 +622,19 @@ class Backtester:
                 rets_sub = rets_sub.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
                 # Tagesweise fortschreiben
-                port_rets = rets_sub.dot(w_ser)  # Series (Index = Tage), kein .values nötig
+                base_port_rets = rets_sub.dot(w_ser)
+
+                exp = pd.Series(1.0, index=base_port_rets.index)
+                if regime_on and bm_s is not None and bm_sma is not None:
+                    sig = (bm_s.reindex(exp.index) >= bm_sma.reindex(exp.index)).fillna(True)
+                    low = float(self.cfg.regime_exposure_low)
+                    exp = exp * (sig.astype(float) * (1.0 - low) + low)
+
+                if vt_on and vt_exp is not None:
+                    exp = exp * vt_exp.reindex(exp.index).fillna(1.0)
+
+                port_rets = base_port_rets * exp
+
                 for idx, r in port_rets.items():
                     equity_val *= (1.0 + float(r))
                     equity_rows.append({"date": pd.Timestamp(idx), "equity": equity_val})
@@ -421,8 +647,7 @@ class Backtester:
             positions_log.append(tmp)
 
             if self.cfg.verbose:
-                print(f"{d.date()} sel={cur_holdings} turnover={turnover:.3f} cost={trade_cost:.4f} "
-                      f"eq={equity_val:.4f} filt={filt_stats}")
+                print(f"{d.date()} holdings={cur_holdings} turnover_eff={turnover:.3f} cost={trade_cost:.4f} eq={equity_val:.4f} filt={filt_stats}")
 
         # 4) Ergebnisse schreiben
         if equity_rows:
@@ -472,6 +697,45 @@ class Backtester:
                 f"Positions:    {pos_path}",
                 f"Trades:       {trd_path}",
             ]
+            # --- Benchmark ---
+            bm = self.cfg.benchmark_ticker
+            if bm:
+                bm_px = download_close([bm], self.cfg.start, self.cfg.end, verbose=False)
+                if not bm_px.empty:
+                    s = bm_px.iloc[:, 0].reindex(eq_df.index).dropna()
+                    bm_eq = (s / s.iloc[0]).rename("benchmark")
+                    bm_ret = bm_eq.pct_change(fill_method=None).dropna()
+
+                    eq = eq_df["equity"].reindex(bm_eq.index).dropna()
+                    eq_ret = eq.pct_change(fill_method=None).dropna()
+
+                    # Kennzahlen
+                    bm_total = float(bm_eq.iloc[-1] - 1.0)
+                    years = max(1e-9, (bm_eq.index[-1] - bm_eq.index[0]).days / 365.25)
+                    bm_cagr = float(bm_eq.iloc[-1] ** (1.0 / years) - 1.0)
+                    # NEU: Benchmark-Volatilität & Sharpe(0%)
+                    bm_vol_ann = float(bm_ret.std() * np.sqrt(252)) if not bm_ret.empty else float("nan")
+                    bm_sharpe = float(bm_ret.mean() / bm_ret.std() * np.sqrt(252)) if bm_ret.std() > 0 else float("nan")
+
+                    # Portfolio vs. Benchmark (optional, praktisch für Vergleich auf einen Blick)
+                    rel_vol = float(vol_ann / bm_vol_ann) if bm_vol_ann > 0 else float("nan")
+                    alpha = float((eq_ret.mean() - bm_ret.mean()) * 252)  # ~annualisierte Exzessrendite
+                    corr = float(eq_ret.corr(bm_ret))
+
+                    # speichern
+                    bm_path = Path(str(out_prefix) + "_benchmark.csv")
+                    pd.concat([eq, bm_eq], axis=1).to_csv(bm_path)
+
+                    # Summary erweitern
+                    summary_lines.extend([
+                        f"Benchmark:     {bm}",
+                        f"BM Total Ret:  {bm_total: .2%}   |  BM CAGR: {bm_cagr: .2%}",
+                        f"BM Volatility: {bm_vol_ann: .2%} |  BM Sharpe(0%): {bm_sharpe: .2f}",
+                        f"Alpha (ann.):  {alpha: .2%}     |  Corr(EQ,BM): {corr: .2f}",
+                        f"Rel. Vol (Port/BM): {rel_vol: .2f}x",
+                        f"Benchmark CSV: {bm_path}",
+                    ])
+
             Path(summ_path).write_text("\n".join(summary_lines), encoding="utf-8")
             print("\n".join(summary_lines))
 
@@ -520,6 +784,35 @@ class Backtester:
             print("Keine Equity-Curve erzeugt (möglicherweise kein Rebalance-Intervall mit Daten).")
 
 
+def _normalize_price_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bringt yfinance-Frames sicher auf Single-Level-Spalten mit Tickernamen.
+    Bevorzugt 'Adj Close', sonst 'Close'. Entfernt ggf. übrige Level.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # 1) Versuche, eine Ebene 'Adj Close' oder 'Close' zu picken – egal auf welchem Level
+        picked = False
+        for lvl in range(df.columns.nlevels):
+            vals = df.columns.get_level_values(lvl)
+            if "Adj Close" in vals:
+                df = df.xs("Adj Close", axis=1, level=lvl, drop_level=True)
+                picked = True
+                break
+            if "Close" in vals:
+                df = df.xs("Close", axis=1, level=lvl, drop_level=True)
+                picked = True
+                break
+        # 2) Falls immer noch MultiIndex (z. B. ('Ticker','something')), letzte Ebene als Ticker behalten
+        if isinstance(df.columns, pd.MultiIndex):
+            # nimm die letzte Ebene als Spalten (Tickerebene) und drople die anderen
+            keep_level = df.columns.nlevels - 1
+            drop_levels = [i for i in range(df.columns.nlevels) if i != keep_level]
+            df = df.droplevel(drop_levels, axis=1)
+    # 3) Strings + Dedupe
+    df.columns = df.columns.astype(str)
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
 # ---------------------------------------
 # Config laden
 # ---------------------------------------
@@ -555,7 +848,46 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         slippage_bps     = _coalesce(a.slippage_bps,      d.get("slippage_bps"),   5.0),
         min_history_days = _coalesce(a.min_history_days,  d.get("min_history_days"), 260),
 
-        verbose          = _coalesce(a.verbose,           d.get("verbose"),        False),
+        use_equal_weight=_coalesce(a.use_equal_weight if a.use_equal_weight else None, d.get("use_equal_weight"), False),
+        friction_eps=_coalesce(a.friction_eps, d.get("friction_eps"), 0.0),
+        weight_round_step=_coalesce(getattr(a, "weight_round_step", None), d.get("weight_round_step"), 0.0),
+        max_turnover_cap=_coalesce(getattr(a, "max_turnover_cap", None), d.get("max_turnover_cap"), 0.0),
+        rebalance_every_n=_coalesce(getattr(a, "rebalance_every_n", None), d.get("rebalance_every_n"), 1),
+        benchmark_ticker=_coalesce(a.benchmark_ticker, d.get("benchmark_ticker"), "SPY"),
+
+        min_position_weight=_coalesce(getattr(a, "min_position_weight", None), d.get("min_position_weight"), 0.0),
+        max_active_names=_coalesce(getattr(a, "max_active_names", None), d.get("max_active_names"), 0),
+
+        # Regime
+        regime_use_filter=_coalesce(
+            (a.regime_use_filter if getattr(a, "regime_use_filter", False) else None),
+            d.get("regime_use_filter"),
+            False
+        ),
+        regime_sma_days=_coalesce(
+            getattr(a, "regime_sma_days", None),
+            d.get("regime_sma_days"),
+            200
+        ),
+        regime_exposure_low=_coalesce(
+            getattr(a, "regime_exposure_low", None),
+            d.get("regime_exposure_low"),
+            0.50
+        ),
+
+        # Vol-Targeting
+        vol_target_ann=_coalesce(
+            getattr(a, "vol_target_ann", None),
+            d.get("vol_target_ann"),
+            None
+        ),
+        vol_lookback_days=_coalesce(
+            getattr(a, "vol_lookback_days", None),
+            d.get("vol_lookback_days"),
+            20
+        ),
+
+        verbose=_coalesce(a.verbose if a.verbose else None, d.get("verbose"), False),
     )
 
 
@@ -580,6 +912,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--cost-bps", type=float)
     ap.add_argument("--slippage-bps", type=float)
     ap.add_argument("--min-history-days", type=int)
+
+    ap.add_argument("--use-equal-weight", action="store_true")
+    ap.add_argument("--friction-eps", type=float)
+    ap.add_argument("--weight-round-step", type=float)
+    ap.add_argument("--max-turnover-cap", type=float)
+    ap.add_argument("--rebalance-every-n", type=int)
+    ap.add_argument("--benchmark-ticker")
+
+    ap.add_argument("--regime-use-filter", action="store_true")
+    ap.add_argument("--regime-sma-days", type=int)
+    ap.add_argument("--regime-exposure-low", type=float)
+
+    ap.add_argument("--vol-target-ann", type=float)  # None = aus
+    ap.add_argument("--vol-lookback-days", type=int)
 
     ap.add_argument("--verbose", action="store_true")
     return ap.parse_args()

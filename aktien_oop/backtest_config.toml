@@ -4,13 +4,13 @@ sector_meta    = "aktien_oop/sp500_meta.csv"   # optional; leer lassen, wenn nic
 save_dir       = "aktien_oop"
 
 # --- Zeitraum & Frequenz ---
-start          = "=2023-05-01"
+start          = "2023-05-01"
 end            = "2025-08-16"
 frequency      = "monthly"   # "monthly" oder "weekly"
 
 # --- Portfolio-Logik ---
 top_k          = 12           # Anzahl Aktien im Portfolio
-buffer_k       = 4           # Turnover-Puffer
+buffer_k       = 5           # Turnover-Puffer
 max_per_sector = 5           # 0 oder negativ = deaktiviert
 
 # --- Kostenmodell (Basispunkte) ---
@@ -22,3 +22,24 @@ min_history_days = 260
 
 # --- Logging ---
 verbose        = true
+
+# --- mit Aktion Index Vergleich
+use_equal_weight  = true   # statt inverse-Vol
+friction_eps      = 0.05    # 5 Prozentpunkt Gewichtsdiff als Schwelle
+weight_round_step  = 0.02        # Zielgewichte auf 2 %-Punkt runden
+benchmark_ticker  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
+max_turnover_cap = 0.50   # pro Termin max. 50 % umschichten (weiches Cap)
+
+min_position_weight = 0.01   # 1 %-Punkt
+max_active_names    = 12     # oder 15, wenn du etwas „Luft“ willst
+
+regime_use_filter   = false
+regime_sma_days     = 200
+regime_exposure_low = 0.60     # nur 60% Exposure, wenn Benchmark < SMA200
+
+# Volatility Targeting (optional)
+vol_target_ann      = 0.20
+vol_lookback_days   = 20
+
+rebalance_every_n  = 1         # nur jeden 2. Termin wirklich traden
+
