@@ -9,8 +9,8 @@ end            = "2025-08-16"
 frequency      = "monthly"   # "monthly" oder "weekly"
 
 # --- Portfolio-Logik ---
-top_k          = 12           # Anzahl Aktien im Portfolio
-buffer_k       = 5           # Turnover-Puffer
+top_k          = 10           # Anzahl Aktien im Portfolio
+buffer_k       = 3           # Turnover-Puffer
 max_per_sector = 5           # 0 oder negativ = deaktiviert
 
 # --- Kostenmodell (Basispunkte) ---
@@ -25,21 +25,30 @@ verbose        = true
 
 # --- mit Aktion Index Vergleich
 use_equal_weight  = true   # statt inverse-Vol
-friction_eps      = 0.05    # 5 Prozentpunkt Gewichtsdiff als Schwelle
-weight_round_step  = 0.02        # Zielgewichte auf 2 %-Punkt runden
-benchmark_ticker  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
-max_turnover_cap = 0.50   # pro Termin max. 50 % umschichten (weiches Cap)
+friction_eps      = 0.000    # 1 Prozentpunkt Gewichtsdiff als Schwelle
+friction_eps_pct = 0.00
+weight_round_step  = 0.01        # Zielgewichte auf 2 %-Punkt runden
+dual_benchmark = true
+benchmark_ticker  = "SPY"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
+benchmark2  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 
-min_position_weight = 0.01   # 1 %-Punkt
-max_active_names    = 12     # oder 15, wenn du etwas „Luft“ willst
+dump_decision_bundles = true
+decisions_dir = "aktien_oop/decisions"
+
+max_turnover_cap = 1.00   # pro Termin max. 50 % umschichten (weiches Cap)
+
+min_position_weight = 0.00   # 1 %-Punkt
+max_active_names    = 8     # oder 15, wenn du etwas „Luft“ willst
 
 regime_use_filter   = false
 regime_sma_days     = 200
 regime_exposure_low = 0.60     # nur 60% Exposure, wenn Benchmark < SMA200
 
 # Volatility Targeting (optional)
-vol_target_ann      = 0.20
+vol_target_ann      = 0.00
 vol_lookback_days   = 20
 
 rebalance_every_n  = 1         # nur jeden 2. Termin wirklich traden
 
+include_cash      = false      # explizites CASH-Gewicht als Residuum führen
+cash_yield_annual = 0.00      # 0.02 = 2% p.a.; 0.00 = zinsloses Cash
