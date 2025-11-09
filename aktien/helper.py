@@ -1,6 +1,8 @@
 import yfinance as yf
 import numpy as np
 import pandas as pd
+import logging
+from .utils import as_series
 from sklearn.linear_model import LinearRegression
 
 # ----------------------------------------
@@ -12,16 +14,25 @@ def load_tickers(path="sp500_tickers.txt"):
         return [line.strip() for line in f if line.strip()]
 
 
-def sp500_above_200dma():
-    df = yf.download("^GSPC", period="250d", progress=False)
-    df = df.dropna()
-    sma200 = df["Close"].rolling(window=200).mean()
-    last_close = float(df["Close"].iloc[-1])
-    last_sma = float(sma200.iloc[-1])
+def sp500_above_200dma(self) -> bool:
+    as_of = pd.Timestamp(self.cfg.as_of) if self.cfg.as_of else pd.Timestamp.now().normalize()
+    df = yf.download("^GSPC", period=self.cfg.period, interval="1d",
+                     progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+    if df is None or df.empty or "Close" not in df.columns:
+        logging.warning("S&P 500: keine Daten erhalten."); return False
+    close = as_series(df["Close"]).dropna()
+    close = close[close.index <= as_of]          # <- nur bis Stichtag
+    if len(close) < 200:
+        logging.warning("S&P 500: zu wenige Close-Werte für 200DMA."); return False
 
-
-    print(f"\nS&P 500: letzter Schlusskurs = {round(last_close, 2)} | 200-Tage-Linie = {round(last_sma, 2)}")
+    sma200 = close.rolling(200).mean().dropna()
+    last_close, last_sma = float(close.iloc[-1]), float(sma200.iloc[-1])
+    logging.info(
+        f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt "
+        f"{'über' if last_close>last_sma else 'unter'} 200DMA"
+    )
     return last_close > last_sma
+
 
 
 def aktie_ueber_100dma(df):

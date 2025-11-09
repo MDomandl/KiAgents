@@ -1,6 +1,7 @@
 # store.py
 from pathlib import Path
 import json
+import csv
 import pandas as pd
 
 class PortfolioStore:
@@ -56,7 +57,7 @@ class PortfolioStore:
         Verhindert CSV-Schema-Drift (unterschiedliche Spaltenanzahlen).
         """
         payload = {
-            "as_of": pd.Timestamp.now().isoformat(),
+            "as_of": (meta.get("as_of") or pd.Timestamp.now().isoformat()),
             "rebalance_frequency": meta.get("rebalance_frequency"),  # <- weekly / monthly
             # feste (optionale) Meta-Felder:
             "universe_size": meta.get("universe_size"),
@@ -87,7 +88,33 @@ class PortfolioStore:
     def load_last_topk(self) -> pd.DataFrame:
         if not self.topk_log.exists():
             return pd.DataFrame()
-        df = pd.read_csv(self.topk_log)
+        expected = ["Ticker", "Weight", "Rank", "Score", "Vol", "Sector", "Flags"]
+
+        try:
+            # 1. Versuch: normales CSV mit Quotes korrekt interpretieren
+            df = pd.read_csv(
+                self.topk_log,
+                engine="python",
+                sep=",",
+                quotechar='"',
+                header=0,
+                names=expected,
+                on_bad_lines="error"  # wechsle auf 'error', damit wir sauber in den Fallback springen
+            )
+        except Exception:
+            # 2. Fallback: Zeilen manuell parsen und Überlauf in 'Flags' zurückführen
+            rows = []
+            with open(self.topk_log, "r", encoding="utf-8", newline="") as f:
+                rdr = csv.reader(f, delimiter=",", quotechar='"', doublequote=True)
+                header = next(rdr, None)  # Header überspringen
+                for parts in rdr:
+                    if len(parts) > 7:
+                        parts = parts[:6] + [",".join(parts[6:])]  # Rest wieder an Flags anhängen
+                    elif len(parts) < 7:
+                        # fehlende Spalten auffüllen, damit der Frame passt
+                        parts += [""] * (7 - len(parts))
+                    rows.append(parts)
+            df = pd.DataFrame(rows, columns=expected)
         if df.empty or "as_of" not in df.columns:
             return pd.DataFrame()
         df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce")

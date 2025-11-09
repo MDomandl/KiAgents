@@ -1,0 +1,22 @@
+top_k = 12
+buffer_k = 3
+rebalance = "monthly"
+max_per_sector = 3
+period = "800d"
+as_of = "2025-10-10"     # nur setzen, wenn du einen fixen Stichtag willst
+max_lookback_days = 720
+tickers_file = "aktien_oop/sp500_tickers.txt"
+sector_meta_file = "aktien_oop/sp500_meta.csv"
+
+[filters]
+gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
+sma_window   = 200
+require_above_sma = true
+
+[windows]
+score_days = 252
+vol_days   = 63
+
+[data]
+adjusted = true
+

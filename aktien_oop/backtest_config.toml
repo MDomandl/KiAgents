@@ -1,17 +1,40 @@
+extends = "strategy.toml"
+
+top_k = 12
+buffer_k = 3
+use_sector_limits = true
+max_per_sector = 3
+adjusted = true
+
+as_of  = "2025-10-10"
+
+# --- Decision Bundles ---
+dump_decision_bundles = true
+decisions_dir = "aktien_oop/decisions"
+decision_prefix = "BT"
+
 # --- Daten & Pfade ---
 tickers_file   = "aktien_oop/sp500_tickers.txt"
 sector_meta    = "aktien_oop/sp500_meta.csv"   # optional; leer lassen, wenn nicht vorhanden
 save_dir       = "aktien_oop"
 
 # --- Zeitraum & Frequenz ---
-start          = "2023-05-01"
-end            = "2025-08-16"
-frequency      = "monthly"   # "monthly" oder "weekly"
+start          = "2020-10-13"
+end            = "2025-10-09"
 
 # --- Portfolio-Logik ---
-top_k          = 10           # Anzahl Aktien im Portfolio
+[topk]
+top_k          = 12           # Anzahl Aktien im Portfolio
 buffer_k       = 3           # Turnover-Puffer
-max_per_sector = 5           # 0 oder negativ = deaktiviert
+
+[rebalance]
+frequency      = "monthly"   # "monthly" oder "weekly"
+
+[limits]
+use_sector_limits = true
+max_per_sector = 3           # 0 oder negativ = deaktiviert
+
+max_active_names    = 8     # oder 15, wenn du etwas „Luft“ willst
 
 # --- Kostenmodell (Basispunkte) ---
 cost_bps       = 0
@@ -21,34 +44,43 @@ slippage_bps   = 7.0
 min_history_days = 260
 
 # --- Logging ---
-verbose        = true
+verbose        = false
 
-# --- mit Aktion Index Vergleich
-use_equal_weight  = true   # statt inverse-Vol
-friction_eps      = 0.000    # 1 Prozentpunkt Gewichtsdiff als Schwelle
+# --- Gewichtung & Reibung ---
+use_equal_weight  = false   # statt inverse-Vol
+friction_eps      = 0.0015    # 1 Prozentpunkt Gewichtsdiff als Schwelle
 friction_eps_pct = 0.00
 weight_round_step  = 0.01        # Zielgewichte auf 2 %-Punkt runden
+max_turnover_cap = 0.40   # pro Termin max. 50 % umschichten (weiches Cap)
+min_position_weight = 0.01   # 1 %-Punkt
+
+# --- Regime & VolTarget ---
+regime_use_filter   = true
+regime_sma_days     = 200
+regime_exposure_low = 0.65     # nur 60% Exposure, wenn Benchmark < SMA200
+
+
+# Volatility Targeting (optional)
+vol_target_ann      = 0.20
+vol_lookback_days   = 20
+
+# --- Benchmarks ---
 dual_benchmark = true
 benchmark_ticker  = "SPY"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 benchmark2  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 
-dump_decision_bundles = true
-decisions_dir = "aktien_oop/decisions"
-
-max_turnover_cap = 1.00   # pro Termin max. 50 % umschichten (weiches Cap)
-
-min_position_weight = 0.00   # 1 %-Punkt
-max_active_names    = 8     # oder 15, wenn du etwas „Luft“ willst
-
-regime_use_filter   = false
-regime_sma_days     = 200
-regime_exposure_low = 0.60     # nur 60% Exposure, wenn Benchmark < SMA200
-
-# Volatility Targeting (optional)
-vol_target_ann      = 0.00
-vol_lookback_days   = 20
-
+# --- Rebalance ---
 rebalance_every_n  = 1         # nur jeden 2. Termin wirklich traden
 
-include_cash      = false      # explizites CASH-Gewicht als Residuum führen
+# --- Cash ---
+include_cash      = true      # explizites CASH-Gewicht als Residuum führen
 cash_yield_annual = 0.00      # 0.02 = 2% p.a.; 0.00 = zinsloses Cash
+max_weight_per_name = 0.30   # 25% pro Name
+
+[core]
+period = "800d"
+as_of  = "2025-10-10"
+
+[windows]
+score_days = 252
+vol_days   = 63

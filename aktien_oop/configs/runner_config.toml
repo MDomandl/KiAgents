@@ -1,0 +1,51 @@
+extends = "strategy.toml"
+
+
+top_k = 12
+buffer_k = 3
+use_sector_limits = true
+max_per_sector = 3
+days_win = 252
+vol_win = 63
+adjusted = true
+
+[core]
+period = "800d"
+as_of = "2025-10-09"
+
+[topk]
+top_k = 12
+buffer_k = 3
+
+[rebalance]
+rebalance = "monthly"
+
+[limits]
+use_sector_limits = true
+max_per_sector = 3
+
+# Filter so wie im BT/Helper gedacht
+days_win = 130
+gap_th = 0.15
+adv_min_dollars = 5000000
+
+max_lookback_days = 720
+
+# Logging & Bundles
+dump_decision_bundles = true
+decisions_dir = "aktien_oop/decisions"
+decision_prefix = "RUN"
+save_dir = "aktien_oop"
+
+tickers_file = "aktien_oop/sp500_tickers.txt"
+sector_meta_file = "aktien_oop/sp500_meta.csv"
+
+verbose = true
+force_rebalance = true
+use_equal_weight = false
+weight_round_step = 0.01
+
+[filters]
+gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
+sma_window   = 200
+require_above_sma = true

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json, sys, platform, getpass, socket
+
+from aktien_oop.universe import load_sp500_tickers, load_sp500_meta
+
 try:
     from zoneinfo import ZoneInfo  # Py>=3.9
 except Exception:
@@ -10,6 +14,7 @@ from dataclasses import dataclass, asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
+from aktien_oop.core_calc import CalcParams, calculate_portfolio
 
 import numpy as np
 import pandas as pd
@@ -41,6 +46,8 @@ class BTConfig:
     tickers_file: str
     sector_meta: Optional[str]
     save_dir: str
+
+    as_of: str
 
     start: str               # "YYYY-MM-DD"
     end: str                 # "YYYY-MM-DD"
@@ -83,10 +90,52 @@ class BTConfig:
 
     verbose: bool = False
 
-
 # ---------------------------------------
 # Hilfen
 # ---------------------------------------
+def safe_date_str(ts, fmt="%Y-%m-%d") -> str:
+    """Gibt ts.strftime(fmt) zurück, oder '' / None, wenn ts leer ist."""
+    if ts is None:
+        return ""
+    try:
+        ts = pd.Timestamp(ts)
+    except Exception:
+        return ""
+    if pd.isna(ts):
+        return ""
+    return ts.strftime(fmt)
+
+def _bt_write_decision_bundle(prefix, decisions_dir, as_of_str,
+                              weights, ranks=None, scores=None, vol=None,
+                              run_id=None, **extras):
+    Path(decisions_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%y%m%d_%H%M%S")
+    fname = f"{prefix}_{(run_id + '_' ) if run_id else ''}{ts}_{as_of_str}.json"
+    # weights -> dict[str,float]
+    if hasattr(weights, "items"):
+        wdict = {str(k): float(v) for k, v in weights.items()}
+    else:
+        try:
+            # z. B. pandas.Series
+            wdict = {str(k): float(v) for k, v in weights.to_dict().items()}
+        except Exception:
+            wdict = {}
+    bundle = {
+        "as_of": as_of_str,
+        "run_id": run_id,
+        "timestamp": ts,
+        "weights": wdict,
+        "ranks":   ranks or {},
+        "scores":  scores or {},
+        "vol":     vol or {},
+    }
+    bundle.update(extras)
+    out = Path(decisions_dir) / fname
+
+    out.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[DECISION] wrote {out}")
+
+
 def _round_and_renorm(w: pd.Series, step: float) -> pd.Series:
     if step and step > 0:
         w = (w / step).round() * step
@@ -101,6 +150,12 @@ def _to_csv_with_runid(path: Path, df: pd.DataFrame, index: bool = True, run_id:
             df.to_csv(f, index=index, lineterminator="\n")
     else:
         df.to_csv(path, index=index, lineterminator="\n")
+
+def _sanitize_for_fs(s: str) -> str:
+    # Entfernt Windows-kritische Zeichen
+    for ch in r'\/:*?"<>|':
+        s = s.replace(ch, "_")
+    return s
 
 def load_tickers(path: str) -> List[str]:
     syms = []
@@ -119,6 +174,31 @@ def load_sector_map(path: Optional[str]) -> Dict[str, str]:
     df = df.dropna(subset=["ticker", "sector"])
     return dict(zip(df["ticker"], df["sector"]))
 
+def _cfg_get(cfg, dotted: str, default=None):
+    cur = cfg
+    for key in dotted.split('.'):
+        if isinstance(cur, dict):
+            if key in cur:
+                cur = cur[key]
+            else:
+                return default
+        else:
+            if hasattr(cur, key):
+                cur = getattr(cur, key)
+            else:
+                return default
+    return cur
+
+def _resolve_universe_paths(cfg):
+    # Erst Versuch: neue Struktur [universe]
+    t = _cfg_get(cfg, "universe.tickers_file")
+    m = _cfg_get(cfg, "universe.meta_file")
+    # Fallbacks für ältere Configs
+    if not t:
+        t = _cfg_get(cfg, "aktien_oop.tickers_file") or _cfg_get(cfg, "tickers_file") or "aktien_oop/sp500_tickers.txt"
+    if not m:
+        m = _cfg_get(cfg, "aktien_oop.meta_file") or _cfg_get(cfg, "meta_file") or "aktien_oop/sp500_meta.csv"
+    return t, m
 
 def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
     import time
@@ -138,13 +218,13 @@ def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
                     auto_adjust=True, progress=False,
                     timeout=30
                 )
-                if df is not None and not df.empty and "Close" in df:
+                if df is not None and not df.empty and "Close" in df.columns:
                     break
             except Exception as e:
                 last_err = e
             time.sleep(1.0 + attempt)
 
-        if df is None or df.empty or "Close" not in df:
+        if df is None or df.empty or "Close" not in df.columns:
             failed.append(t)
             if verbose and last_err:
                 print(f"   {t}: fehlgeschlagen ({last_err})", flush=True)
@@ -359,6 +439,31 @@ def _apply_exposures(series: pd.Series,
         exp = exp * vt_exp.reindex(exp.index).fillna(1.0)
     return series * exp
 
+def apply_exposures_and_cash(
+    base_port_rets: pd.Series,
+    regime_on: bool, bm_s: Optional[pd.Series], bm_sma: Optional[pd.Series], regime_low: float,
+    vt_on: bool, vt_exp: Optional[pd.Series],
+    cash_weight: float, cash_yield_annual: float
+) -> pd.Series:
+    """
+    Wendet Regime/VolTarget auf den Aktien-Teil an und addiert den Cash-Ertrag.
+    Gibt eine tägliche Return-Serie des Gesamtportfolios zurück.
+    """
+    if base_port_rets is None or base_port_rets.empty:
+        stock_part = pd.Series(0.0, index=pd.Index([], dtype='object'))
+    else:
+        stock_part = _apply_exposures(base_port_rets, regime_on, bm_s, bm_sma, regime_low, vt_on, vt_exp)
+    cash_part = float(cash_weight) * _cash_daily_return(float(cash_yield_annual))
+    return stock_part + cash_part
+
+def _period_to_days(period) -> int:
+    """'800d'/'252' → int Tage (robust)."""
+    try:
+        return int(pd.to_timedelta(str(period)) / pd.Timedelta(days=1))
+    except Exception:
+        import re
+        m = re.search(r"\d+", str(period))
+        return int(m.group(0)) if m else 252
 
 # ---------------------------------------
 # Backtester
@@ -366,6 +471,11 @@ def _apply_exposures(series: pd.Series,
 class Backtester:
     def __init__(self, cfg: BTConfig):
         self.cfg = cfg
+        # -- Universe-Loader: zentral & identisch zum Runner --
+        from aktien_oop.universe import load_sp500_tickers, load_sp500_meta
+        ufile, mfile = _resolve_universe_paths(self.cfg)
+        self.tickers = load_sp500_tickers(ufile)
+        self.meta = load_sp500_meta(mfile)
         Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
     def _dbg(self, msg: str):
@@ -373,6 +483,63 @@ class Backtester:
             print(msg)
 
     def run(self):
+        def _first(*vals, default=None):
+            for v in vals:
+                if v is not None:
+                    return v
+            return default
+
+        def _get(obj, name, default=None):
+            return getattr(obj, name, default) if obj is not None else default
+        # --- NORMALIZE (Backtester) ---
+        def _assign(obj, name, value):
+            try:
+                object.__setattr__(obj, name, value)
+            except Exception:
+                setattr(obj, name, value)
+
+        cfg = self.cfg
+
+        windows = _get(cfg, "windows")
+        data = _get(cfg, "data")
+        limits = _get(cfg, "limits")
+        topk = _get(cfg, "topk")
+
+        top_k = getattr(cfg, "top_k", None) or getattr(getattr(cfg, "topk", object()), "top_k", None) or 12
+        buffer_k = getattr(cfg, "buffer_k", None) or getattr(getattr(cfg, "topk", object()), "buffer_k", None) or 3
+        mps = getattr(cfg, "max_per_sector", None) or getattr(getattr(cfg, "limits", object()), "max_per_sector",
+                                                              None) or 3
+        use_sl = getattr(cfg, "use_sector_limits", None)
+        if use_sl is None:
+            use_sl = bool(mps and int(mps) > 0)
+
+        # Backtester hat typ. [windows]; zusätzlich auch Runner-Namen setzen
+        score_days = (getattr(getattr(cfg, "windows", object()), "score_days", None)
+                      or getattr(cfg, "days_win", None) or 252)
+        vol_days = (getattr(getattr(cfg, "windows", object()), "vol_days", None)
+                    or getattr(cfg, "vol_win", None) or 63)
+        max_per_sector = _first(_get(cfg, "max_per_sector"),
+                                _get(limits, "max_per_sector"),
+                                None)
+        use_sector_limits = bool(_first(_get(cfg, "use_sector_limits"),
+                                        (max_per_sector is not None and int(max_per_sector) > 0),
+                                        False))
+
+
+
+        adjusted = getattr(cfg, "adjusted", None)
+        if adjusted is None:
+            adjusted = getattr(getattr(cfg, "data", object()), "adjusted", True)
+
+        _assign(cfg, "top_k", int(top_k))
+        _assign(cfg, "buffer_k", int(buffer_k))
+        _assign(cfg, "max_per_sector", int(mps) if mps is not None else None)
+        _assign(cfg, "use_sector_limits", bool(use_sl))
+        _assign(cfg, "days_win", int(score_days))
+        _assign(cfg, "vol_win", int(vol_days))
+        _assign(cfg, "adjusted", bool(adjusted))
+        # --- /NORMALIZE ---
+
         self._dbg(
             "[CFG] "
             f"freq={self.cfg.frequency}  top_k={self.cfg.top_k}  buffer_k={self.cfg.buffer_k}  "
@@ -461,6 +628,61 @@ class Backtester:
         cur_holdings: List[str] = []
         equity_val = 1.0
 
+        # === PREPARE UNIVERSE, SECTORS, PRELOAD PRICES/RETS ===
+        # 2.1) Universe ermitteln (alles, was du Backtesten willst)
+        try:
+            universe_all = list(self.tickers)  # falls du self.tickers setzt
+        except Exception:
+            # Fallback: S&P500 laden – falls du das in deinem Projekt nutzt
+            universe_all = load_sp500_tickers()
+
+        # 2.2) Sector-Map (Ticker -> Sektor)
+        try:
+            meta = getattr(self, "meta", None)
+            if isinstance(meta, dict) and meta:
+                secmap_pre = {t: meta.get(t, "UNKNOWN") for t in universe_all}
+            else:
+                meta_df = load_sp500_meta()
+                secmap_pre = {t: meta_df.get(t, {}).get("sector", "UNKNOWN") if isinstance(meta_df, dict) else "UNKNOWN"
+                              for t in universe_all}
+        except Exception:
+            secmap_pre = {t: "UNKNOWN" for t in universe_all}
+
+        # 2.3) Preload-Fenster bestimmen
+        asof0 = pd.Timestamp(rdates[0])
+        asofN = pd.Timestamp(rdates[-1])
+        _days = max(800, _period_to_days(getattr(self.cfg, "period", "800d")))
+        bt_start = (asof0 - pd.Timedelta(days=_days)).normalize()
+        bt_end = asofN
+
+        # 2.4) Preise EINMAL laden & normalisieren (breit: Spalten = Ticker)
+        prices_all = download_close(universe_all,
+                                    start=bt_start.date().isoformat(),
+                                    end=bt_end.date().isoformat(),
+                                    verbose=False)
+        prices_all = _normalize_price_columns(prices_all)
+        prices_all.index = pd.to_datetime(prices_all.index).tz_localize(None)
+        prices_all = prices_all[~prices_all.index.duplicated()].sort_index().ffill()
+
+        # 2.5) Returns & SMAs EINMAL berechnen
+        rets_all = prices_all.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        sma200_all = prices_all.rolling(200, min_periods=1).mean()
+        sma100_all = prices_all.rolling(100, min_periods=1).mean()  # falls du 100d brauchst
+
+        # 2.6) valid_cols ableiten (genug Historie + nicht nur NaN)
+        min_hist_days = 252  # anpassen, falls du eine andere Mindesthistorie willst
+        have_hist = (prices_all.notna().rolling(min_hist_days, min_periods=min_hist_days).sum().iloc[
+                         -1] >= min_hist_days)
+        valid_cols = [c for c in prices_all.columns if bool(have_hist.get(c, False))]
+
+        # 2.7) Alles auf valid_cols „trimmen“ (Konsistenz)
+        prices_all = prices_all[valid_cols]
+        rets_all = rets_all[valid_cols]
+        sma200_all = sma200_all[valid_cols]
+        sma100_all = sma100_all[valid_cols]
+        secmap = {t: secmap_pre.get(t, "UNKNOWN") for t in valid_cols}  # <- ab hier 'secmap' verfügbar
+        # === /PREPARE ===
+
         # 3) Backtest-Schleife
         for i, d in enumerate(rdates):
             # Nächsten Stichtag gleich bestimmen
@@ -484,21 +706,18 @@ class Backtester:
 
                     w_stocks = cur_weights.reindex(stock_holdings).fillna(0.0) if stock_holdings else pd.Series(
                         dtype=float)
-                    cash_w = float(cur_weights.get("CASH", 0.0))
-                    cash_rd = _cash_daily_return(self.cfg.cash_yield_annual)
 
                     # Basis-Return der Aktien
                     base_port_rets = rets_sub.dot(w_stocks) if not rets_sub.empty else pd.Series(0.0,
                                                                                                  index=rets_sub.index)
 
-                    # Exposures (Regime/VolTarget) nur auf den Aktien-Teil
-                    stock_part = _apply_exposures(
-                        base_port_rets, regime_on, bm_s, bm_sma, self.cfg.regime_exposure_low, vt_on, vt_exp
+                    cash_w = float(cur_weights.get("CASH", 0.0))
+                    port_rets = apply_exposures_and_cash(
+                        base_port_rets,
+                        regime_on, bm_s, bm_sma, self.cfg.regime_exposure_low,
+                        vt_on, vt_exp,
+                        cash_w, self.cfg.cash_yield_annual
                     )
-
-                    # Cash-Teil additiv
-                    cash_part = float(cur_weights.get("CASH", 0.0)) * _cash_daily_return(self.cfg.cash_yield_annual)
-                    port_rets = stock_part + cash_part
 
                     for idx, r in port_rets.items():
                         equity_val *= (1.0 + float(r))
@@ -513,10 +732,71 @@ class Backtester:
                     tmp.insert(0, "as_of", d.strftime("%Y-%m-%d"))
                     positions_log.append(tmp)
 
-                trades_log.append(
-                    {"date": d.strftime("%Y-%m-%d"), "turnover": 0.0, "trade_cost": 0.0, "enter": "", "exit": ""})
                 if self.cfg.verbose:
                     print(f"{d.date()} [SKIP n={n}] turnover=0.000 cost=0.0000 eq={equity_val:.4f}")
+
+                if getattr(self.cfg, "dump_decision_bundles", False):
+                    _asof_ts = pd.Timestamp(d)
+
+                    def _series_to_dict(_s):
+                        try:
+                            return {str(k): float(v) for k, v in _s.astype(float).items()}
+                        except Exception:
+                            try:
+                                return {str(k): float(v) for k, v in _s.items()}
+                            except Exception:
+                                return {}
+
+                    _ddir = Path(getattr(self.cfg, "decisions_dir", "aktien_oop/decisions"))
+                    _ddir.mkdir(parents=True, exist_ok=True)
+                    _prefix = str(getattr(self.cfg, "decision_prefix", "BT"))
+                    _rid = getattr(self, "_run_id", None)
+                    _rid_str = _sanitize_for_fs(str(_rid)) if _rid else ""
+
+                    # bei Skip: keine Änderungen → eff_new = aktuelle Gewichte
+                    eff_new = cur_weights.copy()
+                    # --- LOCKSTEP: BT-Parameter/Universe-Check (Skip-Zweig) ---
+                    _cfg = self.cfg
+                    _univ = list(self.tickers)  # Backtester lädt sie in __init__
+                    _univ_sha = hashlib.sha1(("|".join(sorted(map(str, _univ)))).encode()).hexdigest()
+                    _asof_dbg = _asof_ts.strftime("%Y-%m-%d")
+
+                    print(
+                        f"[LOCKSTEP][BT ] as_of={_asof_dbg} "
+                        f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
+                        f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
+                        f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
+                        f"score_days=252 vol_days=63 adjusted=True "
+                        f"universe_len={len(_univ)} sha={_univ_sha}"
+                    )
+                    # --- /LOCKSTEP ---
+
+                    print(f"[DBG][BT] write bundle as_of={_asof_ts:%Y-%m-%d} dir={_ddir} prefix={_prefix}")
+                    _bt_write_decision_bundle(
+                        prefix=_prefix,
+                        decisions_dir=str(_ddir),
+                        as_of_str=_asof_ts.strftime("%Y-%m-%d"),
+                        weights=_series_to_dict(eff_new),
+                        run_id=_rid_str or None,
+                        top_k=int(self.cfg.top_k),
+                        buffer_k=int(self.cfg.buffer_k),
+                        max_per_sector=(getattr(self.cfg, "max_per_sector", None)
+                                        or getattr(getattr(self.cfg, "limits", object()), "max_per_sector", None)
+                                        or getattr(getattr(self.cfg, "filters", object()), "max_per_sector", None)),
+                        max_active_names=int(getattr(self.cfg, "max_active_names", 0) or 0),
+                        include_cash=bool(getattr(self.cfg, "include_cash", False)),
+                        params={
+                            "friction_eps": float(getattr(self.cfg, "friction_eps", 0.0) or 0.0),
+                            "friction_eps_pct": float(getattr(self.cfg, "friction_eps_pct", 0.0) or 0.0),
+                            "max_turnover_cap": float(getattr(self.cfg, "max_turnover_cap", 1.0) or 1.0),
+                            "weight_round_step": float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0),
+                        },
+                        old_weights=_series_to_dict(cur_weights),  # vor Skip == aktuell
+                        new_weights=_series_to_dict(eff_new),  # nach Skip == unverändert
+                        turnover_raw=0.0,
+                        turnover_eff=0.0,
+                        holdings=list(eff_new.sort_values(ascending=False).index),
+                    )
                 continue
 
             # Universum mit genügend Historie
@@ -529,313 +809,223 @@ class Backtester:
                 continue
 
             # Scoring + Filter
-            rank_df = score_universe(feats, d, valid_cols)
-            if rank_df.empty:
-                continue
-            filtered, filt_stats = apply_filters(rank_df)
+            # ===== Gemeinsame Kernberechnung (Core-Calc) =====
 
-            # Sektor-Limits
-            # 1) Kandidaten: sector-capped, aber groß genug für den Buffer
-            cand_df = enforce_sector_limits(
-                filtered, secmap, self.cfg.max_per_sector, self.cfg.top_k + self.cfg.buffer_k
+            # 1) Callbacks: gleiche Datenquelle wie sonst im BT
+            def _get_prices_bt(universe, as_of, period, adjusted):
+                """Liefert Preload-Slice (keine Downloads in der Schleife)."""
+                as_of_ts = pd.Timestamp(as_of).tz_localize(None)
+                days = _period_to_days(period)
+                start_ts = as_of_ts - pd.Timedelta(days=days)
+                cols = [c for c in universe if c in prices_all.columns]
+                if not cols:
+                    return prices_all.iloc[0:0]
+                return prices_all.loc[(prices_all.index > start_ts) & (prices_all.index <= as_of_ts), cols]
+
+            def _get_sectors_bt(universe: list[str]) -> dict[str, str]:
+                """
+                Map von Ticker -> Sektor auf Basis deines bereits geladenen secmap.
+                Fällt auf 'UNKNOWN' zurück, wenn kein Eintrag vorhanden ist.
+                """
+                return {t: secmap.get(t, "UNKNOWN") for t in universe}
+
+            # 2) CalcParams aus cfg (nur erlaubte Felder!)
+            _asof_str = d.strftime("%Y-%m-%d")
+            cp = CalcParams(
+                as_of=_asof_str,
+                period=getattr(self.cfg, "period", "800d"),
+                adjusted=bool(adjusted),
+                score_days=int(score_days),
+                vol_days=int(vol_days),
+
+                # Filter
+                use_under_sma=bool(getattr(self.cfg, "use_under_sma", False)),
+                sma_days=int(getattr(self.cfg, "sma_days", 200)),
+                gap_filter=float(getattr(self.cfg, "gap_filter", 0.0)),
+                min_price=float(getattr(self.cfg, "min_price", 0.0)),
+                min_volume=float(getattr(self.cfg, "min_volume", 0.0)),
+
+                # Limits & Auswahl
+                use_sector_limits=bool(use_sector_limits),
+                max_per_sector=getattr(self.cfg, "max_per_sector", 3),
+                top_k=int(self.cfg.top_k),
+                buffer_k=int(self.cfg.buffer_k),
+
+                # Finalisierung
+                include_cash=bool(getattr(self.cfg, "include_cash", False)),
+                weight_round_step=float(getattr(self.cfg, "weight_round_step", 0.0)),
+                max_turnover_cap=float(getattr(self.cfg, "max_turnover_cap", 1.0)),
+                friction_eps=float(getattr(self.cfg, "friction_eps", 0.0)),
+                friction_eps_pct=float(getattr(self.cfg, "friction_eps_pct", 0.0)),
             )
 
-            # 2) Puffer anwenden: alte Titel behalten, falls Rang ≤ top_k + buffer_k
-            target_list = turnover_buffer(
-                cand_df.sort_values("rank"), cur_holdings, self.cfg.top_k, self.cfg.buffer_k
+            # 3) Universe = valid_cols (hat Mindesthistorie)
+            universe = list(valid_cols)
+
+            # Für Buffer: bisherige Holdings aus cur_weights
+            if hasattr(cur_weights, "index"):
+                prev_holdings = list(cur_weights.index)
+            elif isinstance(cur_weights, dict):
+                prev_holdings = list(cur_weights.keys())
+            else:
+                prev_holdings = []
+
+            universe = list(valid_cols)  # identisches Universe in BT & Runner
+
+            # --- Snapshot der alten Gewichte VOR dem Rebalance (für Turnover) ---
+            if hasattr(cur_weights, "to_dict"):
+                _old_weights_snapshot = cur_weights.to_dict()
+            elif isinstance(cur_weights, dict):
+                _old_weights_snapshot = dict(cur_weights)
+            else:
+                _old_weights_snapshot = {}
+            # --------------------------------------------------------------------
+
+            # 4) Kernberechnung: liefert (weights_dict, scores_series)
+            new_w_dict, scores_ser = calculate_portfolio(
+                universe, cp, _get_prices_bt, _get_sectors_bt, prev_holdings=prev_holdings
             )
 
-            # 3) Final: genau die top_k aus den Kandidaten
-            sel = cand_df.set_index("ticker").loc[target_list].reset_index()
-            sel = sel.sort_values("rank").reset_index(drop=True)
+            # --- Turnover/Cost auf Basis des Snapshots (_old_weights_snapshot) ---
+            _old = pd.Series(_old_weights_snapshot, dtype=float)
+            _new = pd.Series(new_w_dict, dtype=float)
+            aligned = pd.concat([_old, _new], axis=1).fillna(0.0)
+            aligned.columns = ["old", "new"]
 
-            # Gewichte
-            w = build_weights(sel, self.cfg.use_equal_weight)
-            sel["allocation_pct"] = (w.reindex(sel["ticker"]).values * 100.0).round(2)
+            raw_turnover = float((aligned["old"] - aligned["new"]).abs().sum() / 2.0)
 
-            # Trades / Turnover / Kosten
-            new_weights = w.copy()  # ← garantiert gesetzt
-            old_weights = cur_weights.copy()
+            _cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            turnover_eff = min(raw_turnover, _cap) if _cap > 0.0 else raw_turnover
 
-            # optionales Runden aus der TOML (z. B. 0.02 = 2 %-Punkte)
-            step = float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0)
-            if step > 0:
-                new_weights = (new_weights / step).round() * step
-                s = float(new_weights.sum())
-                if s > 0:
-                    new_weights = new_weights / s
+            _cost_bps = float(getattr(self.cfg, "cost_bps", 0.0) or 0.0)
+            _slip_bps = float(getattr(self.cfg, "slippage_bps", 0.0) or 0.0)
+            trade_cost = turnover_eff * ((_cost_bps + _slip_bps) / 10000.0)
+            # -------------------------------------------------------
 
-            # Ticker-Index als str
-            new_weights.index = new_weights.index.map(str)
-            old_weights.index = old_weights.index.map(str)
+            # As-Of & nächster Stichtag
+            as_of_ts = pd.Timestamp(d)
+            try:
+                d_next_ts = pd.Timestamp(rdates[i + 1])
+            except Exception:
+                d_next_ts = as_of_ts  # letzter Punkt (keine Zukunft)
 
-            # Union beider Seiten (damit Verkäufe gezählt werden)
-            union = new_weights.index.union(old_weights.index)
-            new_sorted = new_weights.reindex(union, fill_value=0.0).sort_index()
-            old_sorted = old_weights.reindex(union, fill_value=0.0).sort_index()
+            # under_sma (z. B. 200d)
+            last_close_s = prices_all.loc[:as_of_ts].iloc[-1]
+            sma_ref_s = sma200_all.loc[:as_of_ts].iloc[-1]
+            under_sma_s = (last_close_s < sma_ref_s)
+            under_sma_s = pd.Series(under_sma_s, index=prices_all.columns).astype("boolean")
 
-            # Delta & Turnover
-            delta = new_sorted - old_sorted
-            raw_turnover = 0.5 * float(delta.abs().sum())
+            # gap 1d
+            gap_1d_s = rets_all.loc[:as_of_ts].iloc[-1].abs() > 0.12
+            gap_1d_s = pd.Series(gap_1d_s, index=prices_all.columns).astype("boolean")
 
-            # Friction: kleine Änderungen ignorieren (eps in Prozentpunkten)
-            eps_abs = float(self.cfg.friction_eps or 0.0)
-            eps_pct = float(getattr(self.cfg, "friction_eps_pct", 0.0) or 0.0)
+            # Monats-Returns d -> d_next
+            ret_mask = (rets_all.index > as_of_ts) & (rets_all.index <= d_next_ts)
+            rets_sub = rets_all.loc[ret_mask, :]
 
-            if eps_abs > 0.0 or eps_pct > 0.0:
-                base = old_sorted.abs().clip(lower=1e-9)  # Referenz: aktuelle Positionsgröße
-                thr = np.maximum(eps_abs, eps_pct * base)
-                delta = delta.where(delta.abs() >= thr, 0.0)
+            # Gewichte/Portfolio-Return
+            new_weights = new_w_dict.copy()
+            cur_weights = pd.Series(new_weights, dtype=float)
+            if "CASH" in cur_weights.index:
+                cur_weights = cur_weights.drop("CASH")
+            avail = [c for c in cur_weights.index if c in rets_sub.columns]
+            w = cur_weights.reindex(avail, fill_value=0.0)
+            base_port_rets = (rets_sub[avail] * w[avail]).sum(axis=1) if len(avail) else pd.Series(0.0,
+                                                                                                   index=rets_sub.index)
 
-            turnover = 0.5 * float(delta.abs().sum())
+            cur_holdings = list(cur_weights.sort_values(ascending=False).index)
+            eff_new = cur_weights.copy()
 
-            # VOR 'eff_new = old_sorted + delta' – direkt nach Friction und vor dem Cap:
-            sell_zero = (new_sorted == 0) & (old_sorted > 0)
-            buy_pos = (new_sorted > old_sorted)
-            sell_pos = (new_sorted < old_sorted)
+            # === Variablen wie bisher bereitstellen ===
 
-            # Reihenfolge: zuerst 'sell_zero', dann übrige sells, dann buys – alles im Cap-Budget
-            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
-            budget = cap * 2.0  # Cap ist auf 0.5*L1 definiert → Budget hier im L1-Maß
-            if budget > 0:
-                alloc = pd.Series(0.0, index=delta.index)
-
-                # 1) Null-Ziel-Verkäufe priorisieren
-                need = (-delta.where(sell_zero, 0.0)).abs()
-                take = need.copy()
-                if need.sum() > 0 and need.sum() > budget:
-                    take *= budget / need.sum()
-                alloc -= take
-                budget -= float(take.sum())
-
-                # 2) restliche Verkäufe
-                if budget > EPS:
-                    need = (-delta.where(sell_pos & ~sell_zero, 0.0)).abs()
-                    if need.sum() > 0:
-                        take = need * min(1.0, budget / need.sum())
-                        alloc -= take
-                        budget -= float(take.sum())
-
-                # 3) Käufe (vom Restbudget)
-                if budget > EPS:
-                    need = (delta.where(buy_pos, 0.0)).abs()
-                    if need.sum() > 0:
-                        take = need * min(1.0, budget / need.sum())
-                        alloc += take
-                        budget -= float(take.sum())
-
-                delta = alloc
-
-            # Soft-Cap (uniform) – nur für die Cap-Entscheidung berechnen
-            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
-            if cap > 0.0:
-                t_for_cap = 0.5 * float(delta.abs().sum())
-                if t_for_cap > cap:
-                    scale = cap / t_for_cap
-                    delta *= scale
-
-            # Effektive neue Gewichte
-            eff_new = old_sorted + delta
-            s = float(eff_new.sum())
-            if s > 0:
-                if not self.cfg.include_cash:
-                    eff_new = eff_new / s  # klassisch: alles auf 100% Aktien renorm
-                else:
-                    # Bei include_cash: Aktien nicht zwingend auf 100% renormieren.
-                    # Falls numerisch >1.0 (Rundung), auf 1.0 zurückskalieren.
-                    if s > 1.0:
-                        eff_new = eff_new / s
-
-            # 1) Mini-Positionen auf 0 setzen (Dust)
-            dust = float(getattr(self.cfg, "min_position_weight", 0.0) or 0.0)  # z.B. 0.01 = 1%-Punkt
-            if dust > 0:
-                eff_new = eff_new.where(eff_new >= dust, other=0.0)
-                s = float(eff_new.sum())
-                if s > 0:
-                    if not getattr(self.cfg, "include_cash", False):
-                        eff_new = eff_new / s
-                    else:
-                        if s > 1.0:
-                            eff_new = eff_new / s
-
-            # 2) Max. aktive Titel begrenzen (z.B. = top_k)
-            max_names = int(getattr(self.cfg, "max_active_names", getattr(self.cfg, "names_limit", 0)) or 0)
-            if max_names > 0:
-                keep = eff_new.sort_values(ascending=False).head(max_names).index
-                eff_new = eff_new.where(eff_new.index.isin(keep), other=0.0)
-                s = float(eff_new.sum())
-                if s > 0:
-                    if not getattr(self.cfg, "include_cash", False):
-                        eff_new = eff_new / s
-                    else:
-                        if s > 1.0:
-                            eff_new = eff_new / s
-
-                # if max_names == 0 → kein Limit, nichts tun
-
-            # 3) Turnover/Kosten NACH der Finalisierung berechnen
-            # --- FINALER Cap-Guard nach Dust/Limit ---
-            delta_eff = eff_new - old_sorted
-            turnover = 0.5 * float(delta_eff.abs().sum())
-
-            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
-            self._dbg(f"[CAP] t_eff_pre={turnover:.3f}  cap={cap:.3f}") # Diagnose
-
-            if cap > 0.0 and turnover > cap:
-                scale = cap / turnover
-                eff_new = old_sorted + delta_eff * scale
-                # (optional) numerisch renormalisieren:
-                s = float(eff_new.sum())
-                if s > 0:
-                    eff_new = eff_new / s
-                # Turnover neu ermitteln – jetzt garantiert ≤ cap
-                delta_eff = eff_new - old_sorted
-                turnover = 0.5 * float(delta_eff.abs().sum())
-                self._dbg(f"[CAP] t_eff_pre={turnover:.3f}  cap={scale:.3f}")
-            else:
-                self._dbg(f"[CAP] t_eff_pre={turnover:.3f}  <= cap)")
-
-            # --- CASH einfügen (nur wenn aktiviert) ---
-            if getattr(self.cfg, "include_cash", False):
-                s = float(eff_new.sum())
-                cash_w = max(0.0, 1.0 - s)
-                if cash_w > 0:
-                    eff_new.loc["CASH"] = cash_w
-
-            # --- Turnover final: Union inkl. CASH ---
-            union_idx = eff_new.index.union(old_sorted.index)
-            eff_sorted = eff_new.reindex(union_idx, fill_value=0.0).sort_index()
-            old2 = old_sorted.reindex(union_idx, fill_value=0.0).sort_index()
-            delta_eff = eff_sorted - old2
-            turnover   = 0.5 * float(delta_eff.abs().sum())
-
-            eff_new = eff_sorted  # sicherstellen, dass CASH mitgenommen wird
-
-            # --- Post-Limit: nach EPS/Rundung/Cap erneut auf max_active_names kürzen ---
-            max_names = int(getattr(self.cfg, "max_active_names", getattr(self.cfg, "names_limit", 0)) or 0)
-            if max_names > 0:
-                # 1) Aktien von CASH trennen (+ robust gegen NaNs/Typ)
-                stocks = eff_new.drop(index=["CASH"], errors="ignore").fillna(0.0).astype(float)
-
-                # 2) Top max_names aus POSITIVEN Gewichten behalten
-                keep_idx = stocks[stocks > 0].sort_values(ascending=False).head(max_names).index
-                stocks = stocks.where(stocks.index.isin(keep_idx), other=0.0).astype(float)
-
-                # 3) Je nach include_cash renormieren
-                s = float(stocks.sum())
-                if s > 0:
-                    if not getattr(self.cfg, "include_cash", False):
-                        stocks = stocks / s
-                        eff_new = stocks.astype(float)  # ohne CASH-Bucket
-                    else:
-                        if s > 1.0:
-                            stocks = (stocks / s).astype(float)
-                            s = float(stocks.sum())  # neu bestimmen
-                        # CASH neu als Residuum
-                        cash_w = max(0.0, 1.0 - s)
-                        eff_new = stocks.copy()
-                        if cash_w > 0:
-                            eff_new.loc["CASH"] = float(cash_w)
-                else:
-                    # Falls alles zu 0 wurde: alte Effekte behalten (selten)
-                    pass
-
-            # Sicherheitscheck: Gesamtgewicht = 100%
-            # --- Final tidy: numerische Robustheit & exakte 100% sicherstellen ---
-            # 1) NaNs -> 0, winzige Negativgewichte -> 0
-            eff_new = eff_new.fillna(0.0)
-            eff_new = eff_new.where(eff_new >= - EPS, other=0.0).astype(float)
-
-            if getattr(self.cfg, "include_cash", False):
-                # 2) CASH übernimmt letzten Rundungsfehler
-                stock_sum = float(eff_new.drop(index=["CASH"], errors="ignore").sum())
-                cash_w = float(eff_new.get("CASH", 0.0))
-
-                # Numerik-Absicherung
-                if not np.isfinite(stock_sum): stock_sum = 0.0
-                if not np.isfinite(cash_w):    cash_w = 0.0
-
-                tot = stock_sum + cash_w
-                err = 1.0 - tot
-                # CASH absorbiert kleinen Restfehler (unten begrenzen)
-                eff_new.loc["CASH"] = max(0.0, cash_w + err)
-
-                # Letzter Sanity-Check mit etwas großzügiger Toleranz
-                assert abs(float(eff_new.sum()) - 1.0) < 1e-6
-            else:
-                # Ohne CASH normalisieren wir strikt auf 100%
-                s = float(eff_new.sum())
-                if s > 0.0:
-                    eff_new = eff_new / s
-                # und prüfen ebenfalls mit Toleranz
-                assert abs(float(eff_new.sum()) - 1.0) < 1e-6
-
-            # Debug: Cash/Stocks-Summen und aktive Namen
-            if getattr(self.cfg, "include_cash", False):
-                stocks_series = eff_new.drop(index=["CASH"], errors="ignore")
-                stock_sum = float(stocks_series.sum())
-                cash_w = float(eff_new.get("CASH", 0.0))
-                active = int((stocks_series > 0).sum())
-                self._dbg(f"[ALLOC] stocks={stock_sum:.4f}  cash={cash_w:.4f}  names={active}")
-
-            # Kosten auf Basis des ***finalen*** Turnover
-            trade_cost = turnover * (self.cfg.cost_bps + self.cfg.slippage_bps) / 10000.0
-
-            # Zustand setzen
-            cur_weights = eff_new[eff_new > 0].copy()
-            cur_holdings = cur_weights.index.tolist()
-            assert abs(cur_weights.sum() - 1.0) < 1e-9
-
-            # Debug: Cash/Stocks-Summen und aktive Namen
-            if getattr(self.cfg, "include_cash", False):
-                stocks_series = eff_new.drop(index=["CASH"], errors="ignore")
-                stock_sum = float(stocks_series.sum())
-                cash_w = float(eff_new.get("CASH", 0.0))
-                active = int((stocks_series > 0).sum())
-                self._dbg(f"[ALLOC] stocks={stock_sum:.4f}  cash={cash_w:.4f}  names={active}")
-
-            # Enter/Exit-Listen aus effektiven Trades
-            # NEU: set-basierte Variante (typ-sicher)
-            prev_idx = old_sorted[old_sorted > 0.0].index
-            curr_idx = cur_weights[cur_weights > 0.0].index
-
-            enter_list = [t for t in curr_idx if t not in prev_idx]
-            exit_list = [t for t in prev_idx if t not in curr_idx]
-
-            # Positions-Log aus cur_weights bauen
-            sel = pd.DataFrame({"ticker": cur_holdings})
-            sel["allocation_pct"] = (cur_weights.reindex(cur_holdings).values * 100.0).round(2)
+            # a) 'sel' DataFrame für Logs/Ansicht
+            _sel_ticks = list(new_w_dict.keys())
+            sel = pd.DataFrame({"ticker": _sel_ticks})
+            # Score für Anzeige/Ranking (Name wie bisher genutzt)
+            sel["score_adj"] = sel["ticker"].map(lambda t: float(scores_ser.get(t, np.nan)))
+            sel["rank"] = sel["score_adj"].rank(ascending=False, method="first").astype("Int64")
+            sel["allocation_pct"] = sel["ticker"].map(lambda t: round(100.0 * float(new_w_dict.get(t, 0.0)), 2))
             if secmap:
                 sel["sector"] = sel["ticker"].map(secmap).fillna("UNKNOWN")
 
-            trades_log.append({
-                "date": d.strftime("%Y-%m-%d"),
-                "turnover": turnover,
-                "trade_cost": trade_cost,
-                "enter": ",".join(enter_list),
-                "exit": ",".join(exit_list),
-            })
+            # optional: visuelle Rundung gemäß weight_round_step
+            _step = float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0)
+            if _step > 0:
+                sel["allocation_pct"] = (sel["allocation_pct"] / _step).round() * _step
+                _sum = float(sel["allocation_pct"].sum())
+                if _sum > 0:
+                    sel["allocation_pct"] = sel["allocation_pct"] * (100.0 / _sum)
 
-            # (Optional) Debug
-            eps_abs = float(getattr(self.cfg, "friction_eps", 0.0) or 0.0)
-            eps_pct = float(getattr(self.cfg, "friction_eps_pct", 0.0) or 0.0)
-            if eps_pct > 0.0:
-                print(
-                    f"[FRICTION] raw_turnover={raw_turnover:.3f}  eff_turnover={turnover:.3f}  eps={eps_abs:.3f}  eps_pct={eps_pct:.2f}")
-            else:
-                print(f"[FRICTION] raw_turnover={raw_turnover:.3f}  eff_turnover={turnover:.3f}  eps={eps_abs:.3f}")
+            # b) alte/neue Gewichte als Series/Dict, sortiert
+            # b) Anzeige/Debug – keine Turnover-Neuberechnung mehr
+            # === Folgende Variablen werden unten benötigt ===
+            # sel, new_w_dict, ranks_dict, scores_dict, vol_dict, turnover_eff, trade_cost
+            filt_stats = locals().get("filt_stats", {})
+            if getattr(self.cfg, "verbose", False):
+                _holdings_list = list(new_w_dict.keys())
+                print(f"{d} holdings={_holdings_list} turnover_eff={float(turnover_eff):.3f} "
+                      f"cost={float(trade_cost):.4f} eq={equity_val:.4f} filt={filt_stats}")
 
-            # 3d) Performance bis zum nächsten Rebalance-Datum (exklusiv)
-            # exklusives Ende: alle Tage >= d und < d_next
-            # (d, d_next] → Tage NACH dem Rebalance bis inkl. d_next
+            # === Folgende Variablen werden unten benötigt ===
+            # finale (effektive) Gewichte für Bundle/Logs:
+            eff_new = cur_weights.copy()
+
+            # Rückrechnungs-Fenster d -> d_next für Ertragsfortschreibung:
             ret_mask = (feats["rets"].index > d) & (feats["rets"].index <= d_next)
+
+            # Nur Aktien (CASH ausschließen)
             stock_holdings = [t for t in cur_holdings if t != "CASH"]
-            rets_sub = (feats["rets"].loc[ret_mask, stock_holdings]
-                        if stock_holdings else pd.DataFrame(index=feats["rets"].index[ret_mask]))
+
+            # Teil-Returnmatrix (robust behandeln, falls leer)
+            if stock_holdings:
+                rets_sub = feats["rets"].loc[ret_mask, stock_holdings].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            else:
+                rets_sub = pd.DataFrame(index=feats["rets"].index[ret_mask])
+
+            # Gewichte der Aktienseite (CASH hat keine Renditen in feats["rets"])
+            w_stocks = cur_weights.reindex(stock_holdings).fillna(0.0) if stock_holdings else pd.Series(dtype=float)
+
+            # Basis-Return der Aktienseite für die Fortschreibung
+            base_port_rets = rets_sub.dot(w_stocks) if not rets_sub.empty else pd.Series(0.0, index=rets_sub.index)
+
+            # f) optionale Dicts für Bundle
+            ranks_dict = sel.set_index("ticker")["rank"].dropna().astype(int).to_dict()
+            scores_dict = sel.set_index("ticker")["score_adj"].dropna().astype(float).to_dict()
+            vol_dict = {}  # kannst du später befüllen
+
+            # g) Filter-Statistik für Logs (falls später referenziert)
+            filt_stats = {}
+            # ===== /Gemeinsame Kernberechnung =====
 
             # Kosten einmalig am Rebalance-Tag buchen
             equity_val *= (1.0 - trade_cost)
             equity_rows.append({"date": pd.Timestamp(d), "equity": equity_val})
+
+            # --- Trades-Log (für Avg Turnover/Cost) ---
+            # --- Trades-Log (nur am Rebalance-Tag) ---
+            try:
+                _old_ws = _old_weights_snapshot if isinstance(_old_weights_snapshot, dict) else {}
+            except NameError:
+                _old_ws = {}
+            _new_ws = new_w_dict if isinstance(new_w_dict, dict) else {}
+
+            old_set = {t for t, w in _old_ws.items() if t != "CASH" and float(w) > 0.0}
+            new_set = {t for t, w in _new_ws.items() if t != "CASH" and float(w) > 0.0}
+
+            turn_for_log = float(locals().get("turnover", locals().get("turnover_eff", 0.0)))
+            date_str = pd.Timestamp(d).strftime("%Y-%m-%d")
+
+            trades_log.append({
+                "date": date_str,
+                "turnover": turn_for_log,
+                "trade_cost": float(trade_cost),
+                "enter": ",".join(sorted(new_set - old_set)),
+                "exit": ",".join(sorted(old_set - new_set)),
+            })
+
+            if getattr(self.cfg, "verbose", False):
+                print(f"{date_str} [REBAL] turnover={turn_for_log:.3%} cost={float(trade_cost):.4f} "
+                      f"enter=[{','.join(sorted(new_set - old_set))}] exit=[{','.join(sorted(old_set - new_set))}]")
 
             # saubere, label-sichere Gewichtung
             w_stocks = (cur_weights.reindex(stock_holdings).fillna(0.0) if stock_holdings
@@ -846,16 +1036,13 @@ class Backtester:
             base_port_rets = (rets_sub.dot(w_stocks) if not rets_sub.empty
                               else pd.Series(0.0, index=rets_sub.index))
 
-            # Exposures nur auf Aktien-Teil
-            stock_part = _apply_exposures(
-                base_port_rets, regime_on, bm_s, bm_sma, self.cfg.regime_exposure_low, vt_on, vt_exp
-            )
-
             cash_w = float(cur_weights.get("CASH", 0.0))
-            cash_rd = _cash_daily_return(self.cfg.cash_yield_annual)
-            cash_part = cash_w * cash_rd
-
-            port_rets = stock_part + cash_part
+            port_rets = apply_exposures_and_cash(
+                base_port_rets,
+                regime_on, bm_s, bm_sma, self.cfg.regime_exposure_low,
+                vt_on, vt_exp,
+                cash_w, self.cfg.cash_yield_annual
+            )
 
             for idx, r in port_rets.items():
                     equity_val *= (1.0 + float(r))
@@ -869,396 +1056,344 @@ class Backtester:
             tmp.loc[tmp["ticker"] == "CASH", "sector"] = "CASH"
             positions_log.append(tmp)
 
-            if self.cfg.verbose:
-                self._dbg(f"{d.date()} holdings={cur_holdings} turnover_eff={turnover:.3f} cost={trade_cost:.4f} eq={equity_val:.4f} filt={filt_stats}")
+            # Debug-Ausgabe (self._dbg checkt verbose selbst)
+            self._dbg(
+                f"{d.date()} holdings={cur_holdings} turnover_eff={turn_for_log:.3f} "
+                f"cost={trade_cost:.4f} eq={equity_val:.4f} filt={filt_stats}"
+            )
 
-        # 4) Ergebnisse schreiben
-        run_id = getattr(self, "_run_id", None)
+            # --- Decision-Bundle (pro Stichtag) ---
+            if getattr(self.cfg, "dump_decision_bundles", False):
+                # As-of: wir sind im Rebalance-Loop -> d ist gesetzt
+                _asof_ts = pd.Timestamp(d)
 
-        if equity_rows:
-            eq_df = pd.DataFrame(equity_rows).drop_duplicates(subset=["date"]).set_index("date").sort_index()
-            _to_csv_with_runid(eq_path, eq_df, index=True, run_id=run_id)
-        else:
-            eq_df = pd.DataFrame(columns=["equity"])
-
-        if positions_log:
-            pos_df = pd.concat(positions_log, ignore_index=True)
-            _to_csv_with_runid(pos_path, pos_df, index=False, run_id=run_id)
-        else:
-            pos_df = pd.DataFrame(columns=[])
-
-        trd_df = pd.DataFrame(trades_log)
-        _to_csv_with_runid(trd_path, trd_df, index=False, run_id=run_id)
-
-        # 5) Kennzahlen + Summary
-        if not eq_df.empty and "equity" in eq_df:
-            eq = eq_df["equity"]
-            total_return = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
-            n_years = max(1e-9, (eq.index[-1] - eq.index[0]).days / DAYS_PER_YEAR)
-            base = float(eq.iloc[0])
-            cagr = ((float(eq.iloc[-1]) / base) ** (1.0 / n_years) - 1.0)
-
-            eq_ret = eq.pct_change(fill_method=None).dropna()
-            if eq_ret.empty:
-                print("Zu wenig Datenpunkte für Kennzahlen (Equity hat < 2 Zeitpunkte).")
-            vol_ann = float(eq_ret.std() * np.sqrt(252)) if not eq_ret.empty else float("nan")
-            sharpe = float(eq_ret.mean() / eq_ret.std() * np.sqrt(252)) if eq_ret.std() > 0 else float("nan")
-            mdd, dd_start, dd_end = calc_drawdown(eq)
-
-            avg_turnover = float(trd_df["turnover"].mean()) if not trd_df.empty else 0.0
-            avg_cost = float(trd_df["trade_cost"].mean()) if not trd_df.empty else 0.0
-
-            summary_lines = [
-                f"Backtest  {self.cfg.start} → {self.cfg.end}  "
-                f"({self.cfg.frequency}, top_k={self.cfg.top_k}, buffer_k={self.cfg.buffer_k}, "
-                f"max_per_sector={self.cfg.max_per_sector})",
-                f"Total Return: {total_return: .2%}",
-                f"CAGR:         {cagr: .2%}",
-                f"Volatility:   {vol_ann: .2%}",
-                f"Sharpe(0%):   {sharpe: .2f}",
-                f"MaxDD:        {mdd: .2%}  von {dd_start.date()} bis {dd_end.date()}",
-                f"Avg Turnover: {avg_turnover: .2%}  |  Avg Cost: {avg_cost: .4%}",
-            ]
-            # --- Benchmark ---
-            # === Benchmarks (BM1 + optional BM2) ===
-            # eq: deine Portfoliokurve als Series (existiert in deinem Code bereits)
-            # bm_ticker: Primärbenchmark
-            bm_ticker = str(getattr(self.cfg, "benchmark", getattr(self.cfg, "benchmark_ticker", "SXR8.DE")))
-
-            def _bench_metrics(ticker: str, eq_series: pd.Series):
-                """
-                Lädt Benchmark-Schlusskurse für 'ticker' im Zeitfenster von eq_series,
-                normiert auf 1.0 am Start und liefert Series + Kennzahlen zurück.
-                Robust ggü. download_close-Varianten (Series/DataFrame/MultiIndex/Dict/Tuple).
-                """
-                # 1) Fenster bestimmen
-                start_dt = pd.Timestamp(eq_series.index.min()).normalize()
-                end_dt = pd.Timestamp(eq_series.index.max()).normalize()
-                start_s = str(start_dt.date())
-                end_s = str(end_dt.date())
-
-                # 2) Download IMMER als Liste aufrufen (sonst wird "SPY" zu ["S","P","Y"])
-                bm_px = download_close([ticker], start=start_s, end=end_s)
-
-                # 3) Rückgabe-Typen entpacken
-                #   - Tuple: (df, meta) -> df
-                if isinstance(bm_px, tuple) and len(bm_px) >= 1:
-                    bm_px = bm_px[0]
-                #   - Dict: {ticker: Series/DataFrame} -> gewünschtes Element
-                if isinstance(bm_px, dict):
-                    bm_px = bm_px.get(ticker, list(bm_px.values())[0])
-
-                # 4) Auf Series normalisieren (Close-Spalte wählen)
-                if isinstance(bm_px, pd.DataFrame):
-                    df = bm_px
-
-                    # MultiIndex-Columns (z.B. ('Close','SPY'), ('Adj Close','SPY'), ...)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        s = None
-                        # Versuche Ebene 'Close'
+                # Helfer: Series -> dict[str -> float]
+                def _series_to_dict(_s):
+                    try:
+                        return {str(k): float(v) for k, v in _s.astype(float).items()}
+                    except Exception:
                         try:
-                            if 'Close' in df.columns.get_level_values(0):
-                                close_block = df.xs('Close', axis=1, level=0)
-                                if isinstance(close_block, pd.DataFrame):
-                                    if ticker in close_block.columns:
-                                        s = close_block[ticker]
-                                    else:
-                                        s = close_block.iloc[:, 0]
-                                else:
-                                    s = close_block
+                            return {str(k): float(v) for k, v in _s.items()}
                         except Exception:
-                            s = None
-                        # Fallback: erste numerische Spalte
-                        if s is None:
-                            num_cols = df.select_dtypes(include='number').columns
-                            s = df[num_cols[0]] if len(num_cols) > 0 else df.iloc[:, 0]
-                    else:
-                        # Single-Index Columns
-                        if ticker in df.columns:
-                            s = df[ticker]
-                        elif 'Close' in df.columns:
-                            s = df['Close']
-                        else:
-                            num_cols = df.select_dtypes(include='number').columns
-                            s = df[num_cols[0]] if len(num_cols) > 0 else df.iloc[:, 0]
+                            return {}
 
-                elif isinstance(bm_px, pd.Series):
-                    s = bm_px
+                # Roh-/Eff-Turnover robust aus locals
+                _t_raw = float(locals().get("raw_turnover", float("nan")))
+                _t_eff = float(locals().get("turnover", float("nan")))
 
-                else:
-                    # Sonstige Typen (z.B. ndarray/list) -> Series
-                    try:
-                        s = pd.Series(bm_px)
-                    except Exception:
-                        raise TypeError(f"Unsupported benchmark data type: {type(bm_px)}")
+                # Alte Gewichte als Series für das Bundle (vor dem Rebalance)
+                try:
+                    _old_ws_dict = _old_weights_snapshot if isinstance(_old_weights_snapshot, dict) else {}
+                except NameError:
+                    _old_ws_dict = {}
+                old_sorted = pd.Series(_old_ws_dict, dtype=float)
+                old_sorted = old_sorted.reindex(sorted(old_sorted.index)).fillna(0.0).sort_values(ascending=False)
 
-                # 5) Index/Typen säubern
-                # Sicherstellen: DatetimeIndex
-                if not isinstance(s.index, pd.DatetimeIndex):
-                    try:
-                        s.index = pd.to_datetime(s.index)
-                    except Exception:
-                        pass
-                # Numerisch & zeitlich sauber
-                s = pd.to_numeric(s, errors="coerce")
-                s = s.sort_index().ffill()
-                s = s.loc[start_dt:end_dt]
-
-                # 6) Normierte Benchmark-Kurve (1.0 am Start)
-                if len(s) == 0 or pd.isna(s.iloc[0]):
-                    raise ValueError(f"No benchmark data for {ticker} in window {start_s}..{end_s}")
-                first = float(s.iloc[0]) if s.iloc[0] != 0 else 1.0
-                bm_eq_loc = (s / first).reindex(eq_series.index).ffill().dropna().astype(float)
-
-                # 7) Kennzahlen
-                bm_rets = bm_eq_loc.pct_change().fillna(0.0)
-                days = max(1, (bm_eq_loc.index[-1] - bm_eq_loc.index[0]).days)
-                bm_total = float(bm_eq_loc.iloc[-1] - 1.0)
-                bm_cagr = float(bm_eq_loc.iloc[-1] ** (DAYS_PER_YEAR / days) - 1.0)
-                bm_vol_ann = float(bm_rets.std() * np.sqrt(TRADING_DAYS))
-                bm_sharpe = float((bm_rets.mean() * TRADING_DAYS) / (bm_vol_ann + EPS))
-
-                return {
-                    "series": bm_eq_loc,  # garantiert 1D Series[float] mit DatetimeIndex
-                    "total": bm_total,
-                    "cagr": bm_cagr,
-                    "vol": bm_vol_ann,
-                    "sharpe": bm_sharpe,
+                bundle = {
+                    "run_id": getattr(self, "_run_id", None),
+                    "as_of": _asof_ts.strftime("%Y-%m-%d"),
+                    "top_k": int(self.cfg.top_k),
+                    "buffer_k": int(self.cfg.buffer_k),
+                    "max_per_sector": getattr(self.cfg, "max_per_sector", None)
+                        or getattr(getattr(self.cfg, "limits", object()), "max_per_sector", None)
+                        or getattr(getattr(self.cfg, "filters", object()), "max_per_sector", None),
+                    "max_active_names": int(getattr(self.cfg, "max_active_names", 0) or 0),
+                    "include_cash": bool(getattr(self.cfg, "include_cash", False)),
+                    "params": {
+                        "friction_eps": float(getattr(self.cfg, "friction_eps", 0.0) or 0.0),
+                        "friction_eps_pct": float(getattr(self.cfg, "friction_eps_pct", 0.0) or 0.0),
+                        "max_turnover_cap": float(getattr(self.cfg, "max_turnover_cap", 1.0) or 1.0),
+                        "weight_round_step": float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0),
+                    },
+                    # diese Variablen sind an der Stelle vorhanden:
+                    "old_weights": _series_to_dict(old_sorted),  # vor dem Rebalance
+                    "new_weights": _series_to_dict(eff_new),  # finale Gewichte
+                    "turnover_raw": _t_raw,
+                    "turnover_eff": _t_eff,
+                    "holdings": list(eff_new.sort_values(ascending=False).index),
                 }
 
-            # Portfoliokurve eq sicherstellen (falls bei dir eq_df['equity'] heißt, nimm diese Zeile)
-            # eq gibt es bei dir bereits im Benchmark-Block; falls nicht, nutze:
-            # eq = eq_df['equity'].astype(float)
+                _ddir = Path(getattr(self.cfg, "decisions_dir", "aktien_oop/decisions"))
+                _ddir.mkdir(parents=True, exist_ok=True)
+                _prefix = str(getattr(self.cfg, "decision_prefix", "BT"))
+                _rid = getattr(self, "_run_id", None)
+                _rid_str = _sanitize_for_fs(str(_rid)) if _rid else ""
+                _ts = datetime.now().strftime("%y%m%d_%H%M%S")
 
-            bm_ticker = str(getattr(self.cfg, "benchmark", getattr(self.cfg, "benchmark_ticker", "SXR8.DE")))
-            bm1 = _bench_metrics(bm_ticker, eq)
-            bm_eq = bm1["series"].rename("BM1_" + bm_ticker)
+                # Variante A (kurz): run_id falls vorhanden, sonst ts
+                _core = f"{_rid}_{_ts}" if _rid else _ts
+                # --- LOCKSTEP: BT-Parameter/Universe-Check (Trade-Zweig) ---
+                _cfg = self.cfg
+                _univ = list(self.tickers)
+                _univ_sha = hashlib.sha1(("|".join(sorted(map(str, _univ)))).encode()).hexdigest()
+                _asof_dbg = _asof_ts.strftime("%Y-%m-%d")
 
-            # --- ROBUSTER Umschalter für BM2 ---
-            bm2_label = str(getattr(self.cfg, "benchmark2", "") or "").strip()
-            # BM2-Variablen für Linter/Robustheit vorinitialisieren
-            bm2_total = bm2_cagr = bm2_vol_ann = bm2_sharpe = alpha2 = corr2 = rel_vol2 = None
-            bm2_enabled = bool(bm2_label) or bool(getattr(self.cfg, "dual_benchmark", False))
-            self._dbg(f"[BM] dual_benchmark={getattr(self.cfg,'dual_benchmark',False)} bm1={bm_ticker} bm2='{bm2_label}' -> bm2_enabled={bm2_enabled}")
+                print(
+                    f"[LOCKSTEP][BT ] as_of={_asof_dbg} "
+                    f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
+                    f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
+                    f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
+                    f"score_days=252 vol_days=63 adjusted=True "
+                    f"universe_len={len(_univ)} sha={_univ_sha}"
+                )
+                # --- /LOCKSTEP ---
 
-            if bm2_enabled and bm2_label:
-                bm2 = _bench_metrics(bm2_label, eq)
-                bm2_eq = bm2["series"].rename("BM2_" + bm2_label)
+                _bt_write_decision_bundle(
+                    prefix=_prefix,
+                    decisions_dir=str(_ddir),
+                    as_of_str=_asof_ts.strftime("%Y-%m-%d"),
+                    weights=_series_to_dict(eff_new),
+                    ranks=(_series_to_dict(sel.set_index("ticker")["rank"]) if "rank" in sel.columns else None),
+                    scores=(
+                        _series_to_dict(sel.set_index("ticker")["score_adj"]) if "score_adj" in sel.columns else None),
+                    vol=(_series_to_dict(
+                        sel.set_index("ticker")["volatility"]) if "volatility" in sel.columns else None),
+                    run_id=_rid_str or None,
+                    # alles darunter sind deine bisherigen Zusatzfelder aus "bundle":
+                    top_k=int(self.cfg.top_k),
+                    buffer_k=int(self.cfg.buffer_k),
+                    max_per_sector=(getattr(self.cfg, "max_per_sector", None)
+                                    or getattr(getattr(self.cfg, "limits", object()), "max_per_sector", None)
+                                    or getattr(getattr(self.cfg, "filters", object()), "max_per_sector", None)),
+                    max_active_names=int(getattr(self.cfg, "max_active_names", 0) or 0),
+                    include_cash=bool(getattr(self.cfg, "include_cash", False)),
+                    params={
+                        "friction_eps": float(getattr(self.cfg, "friction_eps", 0.0) or 0.0),
+                        "friction_eps_pct": float(getattr(self.cfg, "friction_eps_pct", 0.0) or 0.0),
+                        "max_turnover_cap": float(getattr(self.cfg, "max_turnover_cap", 1.0) or 1.0),
+                        "weight_round_step": float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0),
+                    },
+                    old_weights=_series_to_dict(old_sorted),
+                    new_weights=_series_to_dict(eff_new),
+                    turnover_raw=float(locals().get("raw_turnover", float("nan"))),
+                    turnover_eff=float(locals().get("turnover", float("nan"))),
+                    holdings=list(eff_new.sort_values(ascending=False).index),
+                )
 
-                # BM2-Kennzahlen + Relativgrößen zum Portfolio berechnen
-                bm2_total = float(bm2["total"])
-                bm2_cagr = float(bm2["cagr"])
-                bm2_vol_ann = float(bm2["vol"])
-                bm2_sharpe = float(bm2["sharpe"])
-
-                port_rets = eq.pct_change().fillna(0.0)  # falls schon oben vorhanden, diese Zeile weglassen
-                bm2_rets = bm2["series"].pct_change().fillna(0.0)
-                corr2 = float(np.corrcoef(port_rets, bm2_rets)[0, 1])
-                rel_vol2 = float(port_rets.std() / (bm2_rets.std() + EPS))
-                alpha2 = float((port_rets.mean() - bm2_rets.mean()) * TRADING_DAYS)
-
-            bm_path = Path(str(out_prefix) + "_benchmark.csv")
-            bm_df_legacy = pd.concat([eq, bm_eq], axis=1)
-            _to_csv_with_runid(bm_path, bm_df_legacy, index=True, run_id=getattr(self, "_run_id", None))
-
-            # Kennzahlen in Summary-Variablen schreiben (BM1: rückwärtskompatibel)
-            bm_total = bm1["total"]
-            bm_cagr = bm1["cagr"]
-            bm_vol_ann = bm1["vol"]
-            bm_sharpe = bm1["sharpe"]
-
-            # Alpha etc. gegen BM1 (wie bisher)
-            # (Port-Rets musst du an der Stelle schon haben; sonst kurz berechnen)
-            port_rets = eq.pct_change().fillna(0.0)
-            bm1_rets = bm1["series"].pct_change().fillna(0.0)
-
-            cov = np.cov(port_rets, bm1_rets, ddof=0)
-            corr = float(np.corrcoef(port_rets, bm1_rets)[0, 1])
-            rel_vol = float(port_rets.std() / (bm1_rets.std() + EPS))
-            alpha = float((port_rets.mean() - bm1_rets.mean()) * TRADING_DAYS)
-
-            # --- BM1: Print wie früher ---
-            print(f"Benchmark:     {bm_ticker}")
-            print(f"BM Total Ret:   {bm_total:7.2%}   |  BM CAGR:  {bm_cagr:7.2%}")
-            print(f"BM Volatility:  {bm_vol_ann:6.2%} |  BM Sharpe(0%):  {bm_sharpe:4.2f}")
-            print(f"Alpha (ann.):   {alpha:7.2%}     |  Corr(EQ,BM):  {corr:4.2f}")
-            print(f"Rel. Vol (Port/BM):  {rel_vol:4.2f}x")
-
-            # --- BM1 vs. Portfolio ---
-            port_rets = eq.pct_change().fillna(0.0)
-            bm1_rets = bm1["series"].pct_change().fillna(0.0)
-            corr = float(np.corrcoef(port_rets, bm1_rets)[0, 1])
-            rel_vol = float(port_rets.std() / (bm1_rets.std() + EPS))
-            alpha = float((port_rets.mean() - bm1_rets.mean()) * TRADING_DAYS)
-
-            # --- BM2 vs. Portfolio (nur wenn aktiv) ---
-            if bm2_enabled and bm2_label:
-                bm2_rets = bm2["series"].pct_change().fillna(0.0)
-                corr2 = float(np.corrcoef(port_rets, bm2_rets)[0, 1])
-                rel_vol2 = float(port_rets.std() / (bm2_rets.std() + EPS))
-                alpha2 = float((port_rets.mean() - bm2_rets.mean()) * TRADING_DAYS)
-
-                bm2_total = bm2["total"]
-                bm2_cagr = bm2["cagr"]
-                bm2_vol_ann = bm2["vol"]
-                bm2_sharpe = bm2["sharpe"]
-                if bm2_total is not None:
-                    print(f"Benchmark 2:   {bm2_label}")
-                    print(f"BM2 Total Ret:  {bm2_total:7.2%}   |  BM2 CAGR:  {bm2_cagr:7.2%}")
-                    print(f"BM2 Volatility: {bm2_vol_ann:6.2%} |  BM2 Sharpe(0%):  {bm2_sharpe:4.2f}")
-                    print(f"BM2 Alpha (ann.): {alpha2:7.2%}     |  Corr(EQ,BM2):  {corr2:4.2f}")
-                    print(f"BM2 Rel. Vol (Port/BM2):  {rel_vol2:4.2f}x")
-
-                # Summary erweitern
-                summary_lines += [
-                    f"Benchmark:     {bm_ticker}",
-                    f"BM Total Ret:   {bm_total:7.2%}   |  BM CAGR:  {bm_cagr:7.2%}",
-                    f"BM Volatility:  {bm_vol_ann:6.2%} |  BM Sharpe(0%):  {bm_sharpe:4.2f}",
-                    f"Alpha (ann.):   {alpha:7.2%}     |  Corr(EQ,BM):  {corr:4.2f}",
-                    f"Rel. Vol (Port/BM):  {rel_vol:4.2f}x",
-                ]
-
-                # BM2 (optional)
-                if bm2_total is not None:
-                    summary_lines += [
-                        f"Benchmark 2:   {bm2_label}",
-                        f"BM2 Total Ret:  {bm2_total:7.2%}   |  BM2 CAGR:  {bm2_cagr:7.2%}",
-                        f"BM2 Volatility: {bm2_vol_ann:6.2%} |  BM2 Sharpe(0%):  {bm2_sharpe:4.2f}",
-                        f"BM2 Alpha (ann.): {alpha2:7.2%}     |  Corr(EQ,BM2):  {corr2:4.2f}",
-                        f"BM2 Rel. Vol (Port/BM2):  {rel_vol2:4.2f}x",
-                    ]
-
-            summary_lines += [
-                f"Equity Curve: {eq_path}",
-                f"Positions:    {pos_path}",
-                f"Trades:       {trd_path}",
-                f"Benchmark CSV:{bm_path}",
-            ]
-            txt = "\n".join(summary_lines)
-            if hasattr(self, "_run_id"):
-                txt = f"# run_id={self._run_id}\n" + txt
-            Path(summ_path).write_text(txt, encoding="utf-8")
-          #  print("\n".join(summary_lines))
-
-            # optional: extra Artefakte (Plots/JSON), nur wenn vorhanden
-            if _HAS_REPORTING:
-                try:
-                    from aktien_oop.reporting import write_equity_artifacts
-                    params = {
-                        "tickers_file": self.cfg.tickers_file,
-                        "sector_meta": self.cfg.sector_meta,
-                        "save_dir": self.cfg.save_dir,
-                        "start": self.cfg.start,
-                        "end": self.cfg.end,
-                        "frequency": self.cfg.frequency,
-                        "top_k": self.cfg.top_k,
-                        "buffer_k": self.cfg.buffer_k,
-                        "max_per_sector": self.cfg.max_per_sector,
-                        "cost_bps": self.cfg.cost_bps,
-                        "slippage_bps": self.cfg.slippage_bps,
-                        "min_history_days": self.cfg.min_history_days,
-                        "verbose": self.cfg.verbose,
-                    }
-                    arts = write_equity_artifacts(
-                        equity_or_returns_df=eq_df.reset_index()[["date", "equity"]],
-                        out_prefix=out_prefix,
-                        frequency=self.cfg.frequency,
-                        params=params,
-                        write_params_json=True,
-                    )
-                    print("\nArtefakte erzeugt:")
-                    print(f"  {arts.equity_csv}")
-                    print(f"  {arts.drawdown_csv}")
-                    print(f"  {arts.equity_png}")
-                    print(f"  {arts.drawdown_png}")
-                    print(f"  {arts.summary_txt}")
-                    if arts.params_json:
-                        print(f"  {arts.params_json}")
-                except Exception as e:
-                    print(f"(Hinweis) Reporting übersprungen: {e}")
-
-            # params.json zusätzlich
-            Path(str(out_prefix) + "_params.json").write_text(
-                json.dumps(vars(self.cfg), indent=2, default=str), encoding="utf-8"
-            )
-            # --- Update meta at end ---
-            try:
-                if hasattr(self, "_meta_path") and self._meta_path:
-                    iso_end, _ = _now_local_str("Europe/Berlin")
-
-                    # Diese Variablen-Namen existieren in deinem Summary-Teil:
-                    # total_return, cagr, vol_ann, sharpe, mdd, dd_start, dd_end,
-                    # avg_turnover, avg_cost, bm_total, bm_cagr, bm_vol_ann, bm_sharpe,
-                    # alpha, corr, rel_vol  (→ siehe Summary-Build weiter oben)
-
-                    end_meta = {
-                        "finished_at": iso_end,
-                        "summary": {
-                            "total_return": float(total_return),
-                            "cagr": float(cagr),
-                            "volatility": float(vol_ann),
-                            "sharpe_0": float(sharpe),
-                            "max_drawdown": float(mdd),  # <- war max_dd
-                            "dd_start": _to_jsonable(dd_start),
-                            "dd_end": _to_jsonable(dd_end),
-                            "avg_turnover": float(avg_turnover),
-                            "avg_cost": float(avg_cost),
-                        },
-                    }
-
-                    # Benchmark-Teil nur anhängen, wenn du ihn oben berechnet hast
-                    try:
-                        bm_block = {
-                            "benchmark": str(getattr(self.cfg, "benchmark_ticker", "SXR8.DE")),
-                            "bm_total_return": float(bm_total),
-                            "bm_cagr": float(bm_cagr),
-                            "bm_volatility": float(bm_vol_ann),
-                            "bm_sharpe_0": float(bm_sharpe),
-                            "alpha_ann": float(alpha),
-                            "corr": float(corr),
-                            "rel_vol": float(rel_vol),
-                        }
-                        # Optional BM2 in META
-                        try:
-                            if bm2_total is not None:
-                                bm2_block = {
-                                    "benchmark2": bm2_label,
-                                    "bm2_total_return": float(bm2_total),
-                                    "bm2_cagr": float(bm2_cagr),
-                                    "bm2_volatility": float(bm2_vol_ann),
-                                    "bm2_sharpe_0": float(bm2_sharpe),
-                                    "bm2_alpha_ann": float(alpha2),
-                                    "bm2_corr": float(corr2),
-                                    "bm2_rel_vol": float(rel_vol2),
-                                }
-                                end_meta["summary"].update(bm2_block)
-                        except Exception:
-                            pass
-
-                        end_meta["summary"].update(bm_block)
-                        # --- Files summary (nice to see) ---
-                        try:
-                            print(f"Equity Curve: {eq_path}")
-                            print(f"Positions:    {pos_path}")
-                            print(f"Trades:       {trd_path}")
-                            print(f"Benchmark:    {bm_path}")
-                        except Exception as _:
-                            pass
-
-                    except Exception:
-                        # kein Benchmark berechnet → einfach ohne BM-Block speichern
-                        pass
-
-                    p = Path(self._meta_path)
-                    base = json.loads(p.read_text(encoding="utf-8"))
-                    base.update(end_meta)
-                    _dump_run_meta(p, base)
-                    print(f"[META] updated {p}")
-            except Exception as e:
-                print(f"[META] update failed: {e}")
-
+        # === POST-LOOP: Equity/Benchmark/Summary/META (einmalig) ===
+        # Equity-Kurve robust bauen (aus equity_rows)
+        if equity_rows:
+            eq_df = pd.DataFrame(equity_rows)
+            eq_df["date"] = pd.to_datetime(eq_df["date"]).dt.tz_localize(None)
+            eq_df = eq_df.sort_values("date").drop_duplicates("date")
+            eq = eq_df.set_index("date")["equity"].astype(float)
         else:
             print("Keine Equity-Curve erzeugt (möglicherweise kein Rebalance-Intervall mit Daten).")
+            return
+
+        # Basismetriken (für Summary & META)
+        total_return = float(eq.iloc[-1] - 1.0)
+        days = max(1, (eq.index[-1] - eq.index[0]).days)
+        cagr = float(eq.iloc[-1] ** (DAYS_PER_YEAR / days) - 1.0)
+        port_rets = eq.pct_change().fillna(0.0)
+        vol_ann = float(port_rets.std() * np.sqrt(TRADING_DAYS))
+        sharpe = float((port_rets.mean() * TRADING_DAYS) / (vol_ann + EPS))
+        mdd, dd_start, dd_end = calc_drawdown(eq)
+        avg_turnover = float(np.mean([t["turnover"] for t in trades_log]) if trades_log else 0.0)
+        avg_cost     = float(np.mean([t["trade_cost"] for t in trades_log]) if trades_log else 0.0)
+
+        print(f"Total Return: {total_return:7.2%}   |  CAGR: {cagr:7.2%}")
+        print(f"Volatility:   {vol_ann:6.2%} |  Sharpe(0%): {sharpe:4.2f}")
+        print(f"Max DD:       {mdd:7.2%}   [{dd_start.date()} → {dd_end.date()}]")
+        print(f"Avg Turnover: {avg_turnover:6.2%} |  Avg Cost: {avg_cost:6.4f}")
+
+        # CSVs (ggf. erneut/erstmalig) schreiben – einheitlich inkl. run_id
+        _to_csv_with_runid(eq_path,  eq_df.set_index("date"), index=True,  run_id=getattr(self, "_run_id", None))
+        _to_csv_with_runid(pos_path, pd.concat(positions_log, ignore_index=True) if positions_log else pd.DataFrame(),
+                           index=False, run_id=getattr(self, "_run_id", None))
+        _to_csv_with_runid(trd_path, pd.DataFrame(trades_log), index=False, run_id=getattr(self, "_run_id", None))
+
+        # Einmalige Benchmark-Helferfunktion (außerhalb der Schleife)
+        def _bench_metrics(ticker: str, eq_series: pd.Series):
+            """
+            Lädt Benchmark-Schlusskurse für 'ticker' im Zeitfenster von eq_series,
+            normiert auf 1.0 am Start und liefert Series + Kennzahlen zurück.
+            Robust ggü. download_close-Varianten (Series/DataFrame/MultiIndex/Dict/Tuple).
+            """
+            # 1) Fenster
+            start_dt = pd.Timestamp(eq_series.index.min()).normalize()
+            end_dt   = pd.Timestamp(eq_series.index.max()).normalize()
+            start_s, end_s = str(start_dt.date()), str(end_dt.date())
+
+            # 2) Download immer als Liste aufrufen (sonst wird "SPY" zu ["S","P","Y"])
+            bm_px = download_close([ticker], start=start_s, end=end_s)
+
+            # 3) Rückgabe-Typen entpacken
+            if isinstance(bm_px, tuple) and len(bm_px) >= 1:
+                bm_px = bm_px[0]
+            if isinstance(bm_px, dict):
+                bm_px = bm_px.get(ticker, list(bm_px.values())[0])
+
+            # 4) Auf Series normalisieren (Close/Adj Close wählen)
+            if isinstance(bm_px, pd.DataFrame):
+                df = bm_px
+                # MultiIndex-Columns abwickeln
+                if isinstance(df.columns, pd.MultiIndex):
+                    s = None
+                    try:
+                        if 'Close' in df.columns.get_level_values(0):
+                            close_block = df.xs('Close', axis=1, level=0)
+                            s = close_block[ticker] if ticker in getattr(close_block, "columns", []) else close_block.iloc[:, 0]
+                    except Exception:
+                        pass
+                    if s is None:
+                        try:
+                            if 'Adj Close' in df.columns.get_level_values(0):
+                                adj_block = df.xs('Adj Close', axis=1, level=0)
+                                s = adj_block[ticker] if ticker in getattr(adj_block, "columns", []) else adj_block.iloc[:, 0]
+                        except Exception:
+                            pass
+                    bm_s = s if isinstance(s, pd.Series) else df.iloc[:, 0]
+                else:
+                    # Single-Level: prefer Adj Close/Close heuristisch
+                    cols = list(df.columns)
+                    pick = None
+                    for cand in ["Adj Close", "Close", ticker]:
+                        if cand in cols:
+                            pick = cand; break
+                    bm_s = df[pick] if pick in cols else df.iloc[:, 0]
+            else:
+                bm_s = pd.Series(bm_px)
+
+            bm_s.index = pd.to_datetime(bm_s.index).tz_localize(None)
+            bm_s = bm_s.sort_index().dropna()
+            # Auf eq-Fenster trimmen
+            bm_loc = bm_s.reindex(eq_series.index).ffill().dropna()
+            if bm_loc.empty:
+                return {"series": pd.Series([], dtype=float), "total": None, "cagr": None, "vol": None, "sharpe": None}
+
+            bm_eq_loc = (bm_loc / float(bm_loc.iloc[0])).astype(float)
+            bm_rets   = bm_eq_loc.pct_change().fillna(0.0)
+            bm_total  = float(bm_eq_loc.iloc[-1] - 1.0)
+            dt_days   = max(1, (bm_eq_loc.index[-1] - bm_eq_loc.index[0]).days)
+            bm_cagr   = float(bm_eq_loc.iloc[-1] ** (DAYS_PER_YEAR / dt_days) - 1.0)
+            bm_vol_ann= float(bm_rets.std() * np.sqrt(TRADING_DAYS))
+            bm_sharpe = float((bm_rets.mean() * TRADING_DAYS) / (bm_vol_ann + EPS))
+            return {"series": bm_eq_loc, "total": bm_total, "cagr": bm_cagr, "vol": bm_vol_ann, "sharpe": bm_sharpe}
+
+        # Benchmark 1 (obligatorisch)
+        bm_ticker = str(getattr(self.cfg, "benchmark", getattr(self.cfg, "benchmark_ticker", "SXR8.DE")))
+        bm1 = _bench_metrics(bm_ticker, eq)
+        bm_eq = bm1["series"].rename("BM1_" + bm_ticker)
+
+        # Alpha/Rel.Vol/Corr gegen BM1
+        bm1_rets = bm1["series"].pct_change().fillna(0.0)
+        corr   = float(np.corrcoef(port_rets, bm1_rets)[0, 1])
+        rel_vol = float(port_rets.std() / (bm1_rets.std() + EPS))
+        alpha = float(cagr - bm1["cagr"])
+
+        # Benchmark CSV schreiben
+        bm_path = Path(str(out_prefix) + "_benchmark.csv")
+        bm_df_legacy = pd.concat([eq, bm_eq], axis=1)
+        _to_csv_with_runid(bm_path, bm_df_legacy, index=True, run_id=getattr(self, "_run_id", None))
+
+        # Optionaler BM2
+        bm2_label = str(getattr(self.cfg, "benchmark2", "") or "").strip()
+        bm2_enabled = bool(bm2_label) or bool(getattr(self.cfg, "dual_benchmark", False))
+        self._dbg(f"[BM] dual_benchmark={getattr(self.cfg,'dual_benchmark',False)} bm1={bm_ticker} bm2='{bm2_label}' -> bm2_enabled={bm2_enabled}")
+
+        bm2_total = bm2_cagr = bm2_vol_ann = bm2_sharpe = alpha2 = corr2 = rel_vol2 = None
+        if bm2_enabled and bm2_label:
+            bm2 = _bench_metrics(bm2_label, eq)
+            bm2_rets = bm2["series"].pct_change().fillna(0.0)
+            corr2   = float(np.corrcoef(port_rets, bm2_rets)[0, 1])
+            rel_vol2 = float(port_rets.std() / (bm2_rets.std() + EPS))
+            alpha2 = float(cagr - bm2["cagr"])
+            bm2_total, bm2_cagr, bm2_vol_ann, bm2_sharpe = bm2["total"], bm2["cagr"], bm2["vol"], bm2["sharpe"]
+
+        # Einmalige Prints
+        print(f"Portfolio Total Ret: {total_return:7.2%} | Port CAGR: {cagr:7.2%}")
+        print(f"Benchmark:     {bm_ticker}")
+        print(f"BM Total Ret:   {bm1['total']:7.2%}   |  BM CAGR:  {bm1['cagr']:7.2%}")
+        print(f"BM Volatility:  {bm1['vol']:6.2%} |  BM Sharpe(0%):  {bm1['sharpe']:4.2f}")
+        print(f"Alpha (ann.):   {alpha:7.2%}     |  Corr(EQ,BM):  {corr:4.2f}")
+        print(f"Rel. Vol (Port/BM):  {rel_vol:4.2f}x")
+        if bm2_enabled and bm2_label and bm2_total is not None:
+            print(f"Benchmark 2:   {bm2_label}")
+            print(f"BM2 Total Ret:  {bm2_total:7.2%}   |  BM2 CAGR:  {bm2_cagr:7.2%}")
+            print(f"BM2 Volatility: {bm2_vol_ann:6.2%} |  BM2 Sharpe(0%):  {bm2_sharpe:4.2f}")
+            print(f"BM2 Alpha (ann.): {alpha2:7.2%}     |  Corr(EQ,BM2):  {corr2:4.2f}")
+            print(f"BM2 Rel. Vol (Port/BM2):  {rel_vol2:4.2f}x")
+
+        # Summary-Text (neu aufbauen; summary_lines könnte zuvor nicht existiert haben)
+        summary_lines = [
+            f"Total Return: {total_return:7.2%}   |  CAGR: {cagr:7.2%}",
+            f"Volatility:   {vol_ann:6.2%} |  Sharpe(0%): {sharpe:4.2f}",
+            f"Max DD:       {mdd:7.2%}   [{dd_start.date()} → {dd_end.date()}]",
+            f"Avg Turnover: {avg_turnover:6.2%} |  Avg Cost: {avg_cost:6.4f}",
+            "",
+            f"Benchmark:     {bm_ticker}",
+            f"BM Total Ret:   {bm1['total']:7.2%}   |  BM CAGR:  {bm1['cagr']:7.2%}",
+            f"BM Volatility:  {bm1['vol']:6.2%} |  BM Sharpe(0%):  {bm1['sharpe']:4.2f}",
+            f"Alpha (ann.):   {alpha:7.2%}     |  Corr(EQ,BM):  {corr:4.2f}",
+            f"Rel. Vol (Port/BM):  {rel_vol:4.2f}x",
+        ]
+        if bm2_enabled and bm2_label and bm2_total is not None:
+            summary_lines += [
+                f"Benchmark 2:   {bm2_label}",
+                f"BM2 Total Ret:  {bm2_total:7.2%}   |  BM2 CAGR:  {bm2_cagr:7.2%}",
+                f"BM2 Volatility: {bm2_vol_ann:6.2%} |  BM2 Sharpe(0%):  {bm2_sharpe:4.2f}",
+                f"BM2 Alpha (ann.): {alpha2:7.2%}     |  Corr(EQ,BM2):  {corr2:4.2f}",
+                f"BM2 Rel. Vol (Port/BM2):  {rel_vol2:4.2f}x",
+            ]
+        summary_lines += [
+            f"Equity Curve: {eq_path}",
+            f"Positions:    {pos_path}",
+            f"Trades:       {trd_path}",
+            f"Benchmark CSV:{bm_path}",
+        ]
+        txt = "\n".join(summary_lines)
+        if hasattr(self, "_run_id"):
+            txt = f"# run_id={self._run_id}\n" + txt
+        Path(summ_path).write_text(txt, encoding="utf-8")
+
+        # META am Ende (konsolidiert)
+        try:
+            if hasattr(self, "_meta_path") and self._meta_path:
+                iso_end, _ = _now_local_str("Europe/Berlin")
+                end_meta = {
+                    "finished_at": iso_end,
+                    "summary": {
+                        "total_return": float(total_return),
+                        "cagr": float(cagr),
+                        "volatility": float(vol_ann),
+                        "sharpe": float(sharpe),
+                        "max_drawdown": float(mdd),
+                        "max_drawdown_start": str(dd_start),
+                        "max_drawdown_end": str(dd_end),
+                        "avg_turnover": float(avg_turnover),
+                        "avg_cost": float(avg_cost),
+                        "bm_total": float(bm1['total']),
+                        "bm_cagr": float(bm1['cagr']),
+                        "bm_volatility": float(bm1['vol']),
+                        "bm_sharpe": float(bm1['sharpe']),
+                        **({
+                            "bm2_total": float(bm2_total),
+                            "bm2_cagr": float(bm2_cagr),
+                            "bm2_volatility": float(bm2_vol_ann),
+                            "bm2_sharpe": float(bm2_sharpe)
+                        } if (bm2_enabled and bm2_label and bm2_total is not None) else {})
+                    },
+                }
+                p = Path(self._meta_path)
+                base = json.loads(p.read_text(encoding="utf-8"))
+                base.update(end_meta)
+                _dump_run_meta(p, base)
+                print(f"[META] updated {p}")
+        except Exception as e:
+            print(f"[META] update failed: {e}")
+        # === /POST-LOOP ===
+        # Params-Snapshot (einmalig, Post-Loop)
+        Path(str(out_prefix) + "_params.json").write_text(
+            json.dumps(vars(self.cfg), indent=2, default=str), encoding="utf-8"
+        )
+
+        # Kurze Abschlussmeldung mit Pfaden
+        print(f"Equity:   {eq_path}")
+        print(f"Positions:{pos_path}")
+        print(f"Trades:   {trd_path}")
+        print(f"Bench:    {bm_path}")
+        print(f"Summary:  {summ_path}")
 
 
 def _normalize_price_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1324,7 +1459,6 @@ def _to_jsonable(obj):
     except Exception:
         pass
     try:
-        import pandas as pd
         if isinstance(obj, (pd.Timestamp,)):
             return obj.isoformat()
         if isinstance(obj, (pd.Series,)):
@@ -1427,6 +1561,8 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         start            = _coalesce(a.start,             d.get("start"),          "2018-01-01"),
         end              = _coalesce(a.end,               d.get("end"),            "2025-08-16"),
         frequency        = _coalesce(a.frequency,         d.get("frequency"),      "monthly"),
+
+        as_of=_coalesce(a.start, d.get("as_of"), None),
 
         top_k            = _coalesce(a.top_k,             d.get("top_k"),          8),
         buffer_k         = _coalesce(a.buffer_k,          d.get("buffer_k"),       2),

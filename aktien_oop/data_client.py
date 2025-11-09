@@ -33,24 +33,60 @@ class DataClient:
 
     def download_ohlc(self, ticker: str) -> Optional[pd.DataFrame]:
         t = normalize_ticker(ticker)
-        df = yf.download(t, period=self.cfg.period, interval="1d",
-                         progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+
+        # --- As-of Fenster bestimmen (wenn gesetzt) ---
+        as_of = getattr(self.cfg, "as_of", None)
+        if as_of:
+            as_of_ts = pd.Timestamp(as_of).normalize()
+            lookback = int(getattr(self.cfg, "max_lookback_days", 360))
+            start_s = (as_of_ts - pd.Timedelta(days=lookback)).strftime("%Y-%m-%d")
+            end_s = as_of_ts.strftime("%Y-%m-%d")
+
+            # 1) normalisierter Ticker
+            df = yf.download(t, start=start_s, end=end_s, interval="1d",
+                             progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+        else:
+            # 1) normalisierter Ticker (period-basiert)
+            df = yf.download(t, period=self.cfg.period, interval="1d",
+                             progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+
         df = self._ensure_ohlc(df, ticker)
-        if df is not None: return df
-        df = yf.download(ticker, period=self.cfg.period, interval="1d",
-                         progress=False, auto_adjust=True, threads=False)
+        if df is not None:
+            return df
+
+        # Fallback: Roh-Ticker (z. B. wenn Normalisierung fehlschlägt)
+        if as_of:
+            df = yf.download(ticker, start=start_s, end=end_s, interval="1d",
+                             progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+        else:
+            df = yf.download(ticker, period=self.cfg.period, interval="1d",
+                             progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+
         return self._ensure_ohlc(df, ticker)
 
     def sp500_above_200dma(self) -> bool:
-        df = yf.download("^GSPC", period="250d", interval="1d",
-                         progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+        kw = dict(interval="1d", progress=False, auto_adjust=self.cfg.adjusted, threads=False)
+
+        if getattr(self.cfg, "as_of", None):
+            as_of = pd.to_datetime(self.cfg.as_of).tz_localize(None)
+            end = (as_of + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            start = (as_of - pd.Timedelta(days=max(self.cfg.max_lookback_days, 300))).strftime("%Y-%m-%d")
+            df = yf.download("^GSPC", start=start, end=end, **kw)
+        else:
+            # mind. 250d für 200DMA; nimm notfalls self.cfg.period wenn größer
+            per = self.cfg.period if int(self.cfg.period.rstrip("d")) >= 250 else "250d"
+            df = yf.download("^GSPC", period=per, **kw)
+
         if df is None or df.empty or "Close" not in df.columns:
-            logging.warning("S&P 500: keine Daten erhalten."); return False
+            logging.warning("S&P 500: keine Daten erhalten.");
+            return False
         close = as_series(df["Close"]).dropna()
         if len(close) < 200:
-            logging.warning("S&P 500: zu wenige Close-Werte für 200DMA."); return False
+            logging.warning("S&P 500: zu wenige Close-Werte für 200DMA.");
+            return False
         sma200 = close.rolling(200).mean().dropna()
         last_close, last_sma = float(close.iloc[-1]), float(sma200.iloc[-1])
         logging.info(f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt "
-                     f"{'über' if last_close>last_sma else 'unter'} 200DMA")
+                     f"{'über' if last_close > last_sma else 'unter'} 200DMA")
         return last_close > last_sma
+

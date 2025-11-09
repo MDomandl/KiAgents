@@ -3,6 +3,62 @@ from dataclasses import dataclass
 from pathlib import Path
 import argparse, logging, json
 from typing import Optional
+try:
+    import tomllib  # Py>=3.11
+except Exception:
+    tomllib = None
+
+def _coalesce(cli_val, cfg_val, default):
+    return cli_val if cli_val is not None else (cfg_val if cfg_val is not None else default)
+
+def _deep_merge(dst: dict, src: dict) -> dict:
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+def _resolve_cfg_path(raw: str) -> Path:
+    """
+    Versucht mehrere Basisverzeichnisse:
+    - wie angegeben (relativ zum aktuellen Arbeitsverzeichnis)
+    - relativ zum Paket-Root
+    - relativ zum Parent des Paket-Roots (Projektwurzel)
+    """
+    candidates = [
+        Path(raw).expanduser(),
+        (PKG_ROOT / raw),
+        (PKG_ROOT.parent / raw),
+    ]
+    for c in candidates:
+        try:
+            c = c.resolve()
+        except Exception:
+            pass
+        if c.exists():
+            return c
+    # Fallback: erster Kandidat (wird später zum Fehler)
+    return Path(raw)
+
+def _load_toml_chain(paths: list[str]) -> dict:
+    if not paths:
+        return {}
+    if tomllib is None:
+        raise RuntimeError("Python 3.11+ (tomllib) benötigt für --config.")
+    merged = {}
+    for raw in paths:
+        fp = _resolve_cfg_path(raw)
+        if not fp.exists():
+            raise FileNotFoundError(
+                f"Config-Datei nicht gefunden: '{raw}'. "
+                f"Versucht u.a.: '{fp}'. Bitte Pfad prüfen."
+            )
+        with open(fp, "rb") as f:
+            d = tomllib.load(f) or {}
+        _deep_merge(merged, d)
+    return merged
+
 
 
 # -----------------------
@@ -65,8 +121,17 @@ class Config:
     rebalance_frequency: str = "weekly"  # "monthly" oder "weekly"
     verbose: bool = False # via CLI überschreibbar
     lib_debug: bool = False
+    use_equal_weight: bool = False
+    weight_round_step: float = 0.0
 
     show_plots: bool = False
+    # Decision Bundles (für Comparator / Runner)
+    dump_decision_bundles: bool = True
+    decisions_dir: Path = PKG_ROOT / "decisions"
+    decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
+
+    as_of: str | None = None
+    max_lookback_days: int = 360  # Sicherheits-Puffer, falls as_of genutzt wird
 
     @property
     def force(self) -> bool:
@@ -76,18 +141,108 @@ class Config:
     max_per_sector: int | None = 2                 # Global: max. 2 Titel je Sektor (None = aus)
     sector_limits: dict | None = None               # Spezifische Limits, z. B. {"Industrials":1}
 
+    def __post_init__(self):
+        # frozen=True → object.__setattr__
+        object.__setattr__(self, "tickers_file", Path(self.tickers_file).resolve())
+        object.__setattr__(self, "sector_meta_file", Path(self.sector_meta_file).resolve())
+        object.__setattr__(self, "save_dir", Path(self.save_dir).resolve())
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+
     @classmethod
     def from_cli(cls):
         ap = argparse.ArgumentParser()
-        ap.add_argument("--tickers", dest="tickers_file", type=Path)
-        ap.add_argument("--sector-meta", dest="sector_meta_file", type=Path)
-        ap.add_argument("--save-dir", dest="save_dir", type=Path)
-        ap.add_argument("--verbose", action="store_true")
-        ap.add_argument("--lib-debug", action="store_true")
-        ap.add_argument("--force", dest="force_rebalance", action="store_true")
-        ap.add_argument("--show-plots", action="store_true", help="Equity/Drawdown-Plots anzeigen")
+        # im Argumentparser:
+        ap.add_argument(
+            "--config", dest="configs", action="append", type=str, default=[],
+            help="TOML-Datei; mehrfach angeben für Overlays (Basis zuerst, Overlay danach)"
+        )
+
+        ap.add_argument("--tickers", dest="tickers_file", type=str)
+        ap.add_argument("--sector-meta", dest="sector_meta_file", type=str)
+        ap.add_argument("--save-dir", dest="save_dir", type=str)
+
+        ap.add_argument("--top-k", dest="top_k", type=int)
+        ap.add_argument("--buffer-k", dest="buffer_k", type=int)
+        ap.add_argument("--rebalance", dest="rebalance_frequency", choices=["weekly", "monthly"])
+        ap.add_argument("--max-per-sector", dest="max_per_sector", type=int)
+        ap.add_argument("--equal-weight", dest="use_equal_weight", action="store_true", default=None)
+        ap.add_argument("--weight-round-step", dest="weight_round_step", type=float)
+        # Optional dict z.B. {"Energy":1,"IT":2} – zuerst weglassen, bei Bedarf parse_json ergänzen
+        # ap.add_argument("--sector-limits", dest="sector_limits", type=str)
+
+        # WICHTIG: Booleans mit default=None, damit „nicht angegeben“ ≠ False ist
+        ap.add_argument("--verbose", dest="verbose", action="store_true", default=None)
+        ap.add_argument("--lib-debug", dest="lib_debug", action="store_true", default=None)
+        ap.add_argument("--force", dest="force_rebalance", action="store_true", default=None)
+
+        # Decision-Bundles
+        ap.add_argument("--dump-decisions", dest="dump_decision_bundles", action="store_true", default=None)
+        ap.add_argument("--no-dump-decisions", dest="dump_decision_bundles", action="store_false", default=None)
+        ap.add_argument("--decisions-dir", dest="decisions_dir", type=str)
+        ap.add_argument("--prefix", dest="prefix", type=str)
+        ap.add_argument("--as-of", type=str, default=None,
+                       help="Stichtag YYYY-MM-DD; wenn gesetzt, lädt der Runner Daten mit start/end statt period")
+        ap.add_argument("--period", type=str, default=None,
+                       help="Fallback-Period (z. B. 400d), wenn --as-of nicht gesetzt ist")
+        ap.add_argument("--max-lookback-days", dest="max_lookback_days", type=int)
+
         args = ap.parse_args()
-        return Config(**{k: v for k, v in vars(args).items() if v is not None})
+
+        cfg_toml = _load_toml_chain(args.configs or [])
+        period = args.period or cfg_toml.get("period") or "400d"
+        as_of = args.as_of or cfg_toml.get("as_of")
+        max_lookback_days = args.max_lookback_days or int(cfg_toml.get("max_lookback_days", 360))
+        d = cfg_toml  # << TOML-Werte hier hinein!
+
+        # Helper, um Boolean-Flags nur bei explizitem CLI-Setzen zu übernehmen:
+        def _bool_merge(cli_val, cfg_key, default):
+            if cli_val is not None:
+                return bool(cli_val)
+            return bool(d.get(cfg_key, default))
+
+        cfg = cls(
+            tickers_file=Path(_coalesce(args.tickers_file, d.get("tickers_file"), cls.tickers_file)),
+            sector_meta_file=Path(_coalesce(args.sector_meta_file, d.get("sector_meta_file"), cls.sector_meta_file)),
+            save_dir=Path(_coalesce(args.save_dir, d.get("save_dir"), cls.save_dir)),
+
+            top_k=_coalesce(args.top_k, d.get("top_k"), cls.top_k),
+            buffer_k=_coalesce(args.buffer_k, d.get("buffer_k"), cls.buffer_k),
+            rebalance_frequency=_coalesce(args.rebalance_frequency,
+                                          d.get("rebalance_frequency", d.get("rebalance")),
+                                          cls.rebalance_frequency),
+
+            use_equal_weight=_coalesce(args.use_equal_weight, d.get("use_equal_weight"), cls.use_equal_weight),
+            weight_round_step=_coalesce(args.weight_round_step, d.get("weight_round_step"), cls.weight_round_step),
+
+            max_per_sector=_coalesce(args.max_per_sector, d.get("max_per_sector"), cls.max_per_sector),
+            # sector_limits = parse_json(...) wenn du das nutzen willst
+
+            verbose=_bool_merge(args.verbose, "verbose", cls.verbose),
+            lib_debug=_bool_merge(args.lib_debug, "lib_debug", cls.lib_debug),
+            force_rebalance=_bool_merge(args.force_rebalance, "force_rebalance", cls.force_rebalance),
+            period=period,
+            as_of=as_of,
+            max_lookback_days=max_lookback_days,
+            dump_decision_bundles=_bool_merge(args.dump_decision_bundles, "dump_decision_bundles",
+                                              cls.dump_decision_bundles),
+            decisions_dir=Path(_coalesce(args.decisions_dir, d.get("decisions_dir"), cls.decisions_dir)),
+            decision_prefix=_coalesce(args.prefix, d.get("decision_prefix", d.get("prefix")), cls.decision_prefix),
+
+            # Diese drei Felder sind nicht im dataclass? → füge sie dort hinzu (s.u.)
+            # dump_decision_bundles, decisions_dir, prefix
+        )
+
+        # Logging früh setzen
+        setup_logging(cfg.verbose, cfg.lib_debug)
+        logging.debug(
+            "CFG: top_k=%s buffer_k=%s rebalance=%s max_per_sector=%s sector_limits=%s decisions_dir=%s decision_prefix=%s dump=%s",
+            cfg.top_k, cfg.buffer_k, cfg.rebalance_frequency, cfg.max_per_sector, cfg.sector_limits,
+            str(getattr(cfg, "decisions_dir", None)), getattr(cfg, "decision_prefix", None),
+            getattr(cfg, "dump_decision_bundles", None)
+        )
+
+        return cfg
 
 
 def _parse_sector_limits(pairs: list[str] | None) -> dict[str,int] | None:
@@ -102,19 +257,6 @@ def _parse_sector_limits(pairs: list[str] | None) -> dict[str,int] | None:
             except ValueError:
                 pass
     return out or None
-
-def resolve_paths(self):
-    self.tickers_file = Path(self.tickers_file).resolve()
-    self.sector_meta_file = Path(self.sector_meta_file).resolve()
-    self.save_dir = Path(self.save_dir).resolve()
-    self.save_dir.mkdir(parents=True, exist_ok=True)
-
-def __post_init__(self):
-    self.resolve_paths()
-    self.tickers_file = Path(self.tickers_file).resolve()
-    self.sector_meta_file = Path(self.sector_meta_file).resolve()
-    self.save_dir = Path(self.save_dir).resolve()
-    self.save_dir.mkdir(parents=True, exist_ok=True)
 
 def _coerce_limit(x: Optional[int]) -> Optional[int]:
     """<=0 oder None bedeutet 'deaktiviert'."""
@@ -170,4 +312,6 @@ def parse_args() -> Config:
         sector_meta_file=Path(a.sector_meta) if a.sector_meta is not None else defaults.sector_meta_file,
         max_per_sector=_coerce_limit(a.max_per_sector) if a.max_per_sector is not None else defaults.max_per_sector,
         sector_limits=sector_limits if sector_limits is not None else defaults.sector_limits,
+        as_of=a.as_of if hasattr(a, "as_of") else None,
+
     )
