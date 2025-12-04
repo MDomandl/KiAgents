@@ -148,7 +148,6 @@ class Config:
         object.__setattr__(self, "save_dir", Path(self.save_dir).resolve())
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-
     @classmethod
     def from_cli(cls):
         ap = argparse.ArgumentParser()
@@ -181,19 +180,46 @@ class Config:
         ap.add_argument("--no-dump-decisions", dest="dump_decision_bundles", action="store_false", default=None)
         ap.add_argument("--decisions-dir", dest="decisions_dir", type=str)
         ap.add_argument("--prefix", dest="prefix", type=str)
+
         ap.add_argument("--as-of", type=str, default=None,
-                       help="Stichtag YYYY-MM-DD; wenn gesetzt, lädt der Runner Daten mit start/end statt period")
+                        help="Stichtag YYYY-MM-DD; wenn gesetzt, lädt der Runner Daten mit start/end statt period")
         ap.add_argument("--period", type=str, default=None,
-                       help="Fallback-Period (z. B. 400d), wenn --as-of nicht gesetzt ist")
+                        help="Fallback-Period (z. B. 400d), wenn --as-of nicht gesetzt ist")
         ap.add_argument("--max-lookback-days", dest="max_lookback_days", type=int)
 
         args = ap.parse_args()
 
+        # --- TOML laden & Sections aufsplitten ---
         cfg_toml = _load_toml_chain(args.configs or [])
-        period = args.period or cfg_toml.get("period") or "400d"
-        as_of = args.as_of or cfg_toml.get("as_of")
-        max_lookback_days = args.max_lookback_days or int(cfg_toml.get("max_lookback_days", 360))
-        d = cfg_toml  # << TOML-Werte hier hinein!
+
+        core_cfg = cfg_toml.get("core", {}) or {}
+        win_cfg = cfg_toml.get("windows", {}) or {}
+        lim_cfg = cfg_toml.get("limits", {}) or {}
+        reb_cfg = cfg_toml.get("rebalance", {}) or {}
+        topk_cfg = cfg_toml.get("topk", {}) or {}
+
+        # flaches Dict für „einfache“ Keys (Top-Level + core + limits etc.)
+        d: dict = dict(cfg_toml)
+        d.update(core_cfg)
+        d.setdefault("top_k", topk_cfg.get("top_k"))
+        d.setdefault("buffer_k", topk_cfg.get("buffer_k"))
+
+        # limits
+        if "use_sector_limits" in lim_cfg:
+            d.setdefault("use_sector_limits", lim_cfg["use_sector_limits"])
+        if "max_per_sector" in lim_cfg:
+            d.setdefault("max_per_sector", lim_cfg["max_per_sector"])
+
+        # windows (kann der Runner später direkt aus win_cfg lesen)
+        if "score_days" in win_cfg:
+            d.setdefault("score_days", win_cfg["score_days"])
+        if "vol_days" in win_cfg:
+            d.setdefault("vol_days", win_cfg["vol_days"])
+
+        # Kern-Parameter period/as_of/max_lookback
+        period = args.period or core_cfg.get("period") or d.get("period") or cls.period
+        as_of = args.as_of or core_cfg.get("as_of") or d.get("as_of")
+        max_lookback_days = args.max_lookback_days or int(d.get("max_lookback_days", cls.max_lookback_days))
 
         # Helper, um Boolean-Flags nur bei explizitem CLI-Setzen zu übernehmen:
         def _bool_merge(cli_val, cfg_key, default):
@@ -202,48 +228,79 @@ class Config:
             return bool(d.get(cfg_key, default))
 
         cfg = cls(
-            tickers_file=Path(_coalesce(args.tickers_file, d.get("tickers_file"), cls.tickers_file)),
-            sector_meta_file=Path(_coalesce(args.sector_meta_file, d.get("sector_meta_file"), cls.sector_meta_file)),
-            save_dir=Path(_coalesce(args.save_dir, d.get("save_dir"), cls.save_dir)),
+            tickers_file=Path(_coalesce(args.tickers_file,
+                                        d.get("tickers_file"),
+                                        cls.tickers_file)),
+            sector_meta_file=Path(_coalesce(args.sector_meta_file,
+                                            d.get("sector_meta_file", d.get("sector_meta")),
+                                            cls.sector_meta_file)),
+            save_dir=Path(_coalesce(args.save_dir,
+                                    d.get("save_dir"),
+                                    cls.save_dir)),
 
             top_k=_coalesce(args.top_k, d.get("top_k"), cls.top_k),
             buffer_k=_coalesce(args.buffer_k, d.get("buffer_k"), cls.buffer_k),
-            rebalance_frequency=_coalesce(args.rebalance_frequency,
-                                          d.get("rebalance_frequency", d.get("rebalance")),
-                                          cls.rebalance_frequency),
+            rebalance_frequency=_coalesce(
+                args.rebalance_frequency,
+                reb_cfg.get("frequency", d.get("rebalance_frequency", d.get("rebalance"))),
+                cls.rebalance_frequency,
+            ),
 
-            use_equal_weight=_coalesce(args.use_equal_weight, d.get("use_equal_weight"), cls.use_equal_weight),
-            weight_round_step=_coalesce(args.weight_round_step, d.get("weight_round_step"), cls.weight_round_step),
+            use_equal_weight=_coalesce(args.use_equal_weight,
+                                       d.get("use_equal_weight"),
+                                       cls.use_equal_weight),
+            weight_round_step=_coalesce(args.weight_round_step,
+                                        d.get("weight_round_step"),
+                                        cls.weight_round_step),
 
-            max_per_sector=_coalesce(args.max_per_sector, d.get("max_per_sector"), cls.max_per_sector),
-            # sector_limits = parse_json(...) wenn du das nutzen willst
+            max_per_sector=_coalesce(args.max_per_sector,
+                                     d.get("max_per_sector"),
+                                     cls.max_per_sector),
 
             verbose=_bool_merge(args.verbose, "verbose", cls.verbose),
             lib_debug=_bool_merge(args.lib_debug, "lib_debug", cls.lib_debug),
             force_rebalance=_bool_merge(args.force_rebalance, "force_rebalance", cls.force_rebalance),
+
             period=period,
             as_of=as_of,
             max_lookback_days=max_lookback_days,
-            dump_decision_bundles=_bool_merge(args.dump_decision_bundles, "dump_decision_bundles",
-                                              cls.dump_decision_bundles),
-            decisions_dir=Path(_coalesce(args.decisions_dir, d.get("decisions_dir"), cls.decisions_dir)),
-            decision_prefix=_coalesce(args.prefix, d.get("decision_prefix", d.get("prefix")), cls.decision_prefix),
 
-            # Diese drei Felder sind nicht im dataclass? → füge sie dort hinzu (s.u.)
-            # dump_decision_bundles, decisions_dir, prefix
+            dump_decision_bundles=_bool_merge(args.dump_decision_bundles,
+                                              "dump_decision_bundles",
+                                              cls.dump_decision_bundles),
+            decisions_dir=Path(_coalesce(args.decisions_dir,
+                                         d.get("decisions_dir"),
+                                         cls.decisions_dir)),
+            decision_prefix=_coalesce(args.prefix,
+                                      d.get("decision_prefix", d.get("prefix")),
+                                      cls.decision_prefix),
         )
+
+        # nested Sections anhängen, damit der Runner sie sieht
+        object.__setattr__(cfg, "core", core_cfg)
+        object.__setattr__(cfg, "windows", win_cfg)
+        object.__setattr__(cfg, "limits", lim_cfg)
+        object.__setattr__(cfg, "rebalance", reb_cfg)
+
+        # sinnvolle Fallbacks für score_days/vol_days direkt am cfg
+        if "score_days" in d:
+            object.__setattr__(cfg, "score_days", int(d["score_days"]))
+        if "vol_days" in d:
+            object.__setattr__(cfg, "vol_days", int(d["vol_days"]))
 
         # Logging früh setzen
         setup_logging(cfg.verbose, cfg.lib_debug)
         logging.debug(
-            "CFG: top_k=%s buffer_k=%s rebalance=%s max_per_sector=%s sector_limits=%s decisions_dir=%s decision_prefix=%s dump=%s",
-            cfg.top_k, cfg.buffer_k, cfg.rebalance_frequency, cfg.max_per_sector, cfg.sector_limits,
-            str(getattr(cfg, "decisions_dir", None)), getattr(cfg, "decision_prefix", None),
-            getattr(cfg, "dump_decision_bundles", None)
+            "CFG: top_k=%s buffer_k=%s rebalance=%s max_per_sector=%s "
+            "sector_limits=%s decisions_dir=%s decision_prefix=%s dump=%s",
+            cfg.top_k, cfg.buffer_k, cfg.rebalance_frequency,
+            cfg.max_per_sector, cfg.sector_limits,
+            str(getattr(cfg, "decisions_dir", None)),
+            getattr(cfg, "decision_prefix", None),
+            getattr(cfg, "dump_decision_bundles", None),
         )
 
         return cfg
-
 
 def _parse_sector_limits(pairs: list[str] | None) -> dict[str,int] | None:
     """Erwartet z. B.: ['Information Technology=2','Industrials=1']"""

@@ -1,22 +1,99 @@
 # runner.py
 from __future__ import annotations
 
-from typing import List, Dict, Optional
+import dataclasses
+from typing import List, Dict
+import itertools
+
+import datetime
 import numpy as np
 import pandas as pd
-import logging
 import hashlib
 from pathlib import Path
 from aktien_oop.core_calc import CalcParams, calculate_portfolio
 
-from datetime import datetime
-import json
-from .config import Config, setup_logging, normalize_ticker, setup_logging
+import logging
+from json import dumps
+from .config import Config, normalize_ticker, setup_logging
 from .data_client import DataClient
 from .engine import SignalEngine
 from .store import PortfolioStore
 from .rebalance import Rebalancer
 
+def _json_default(obj):
+    """
+    Helper für json.dumps: wandelt Timestamp/Datum in Strings um.
+    Alles andere lässt er bewusst knallen, damit wir Fehler sehen.
+    """
+    if isinstance(obj, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    return str(obj)  # fallback: notfalls als String
+
+# --- Kleine Helper-Funktion für JSON-kompatible Dicts -----------------------
+def _series_to_dict(s):
+    """
+    Wandelt eine pandas.Series (oder bereits ein dict) in ein
+    JSON-freundliches Dict[str, float] um. None bleibt None.
+    """
+    if s is None:
+        return None
+
+    # schon ein dict -> direkt zurück
+    if isinstance(s, dict):
+        return s
+
+    try:
+        import pandas as pd  # zur Sicherheit, ist aber oben meist schon importiert
+    except ImportError:
+        # Falls pandas nicht verfügbar ist, einfach normal casten
+        return {str(k): float(v) for k, v in dict(s).items()}
+
+    if isinstance(s, pd.Series):
+        s = s.dropna()
+        return {str(k): float(v) for k, v in s.items()}
+
+    # Fallback: alles, was sich wie ein Mapping/Iterable verhält
+    return {str(k): float(v) for k, v in dict(s).items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class RunCfgNormalized:
+    # Kern-Infos
+    as_of: pd.Timestamp
+    period: str              # z.B. "400d"
+
+    # Scoring / Volatilität
+    score_days: int
+    vol_days: int | None     # None = keine Vol-Berechnung
+
+    # Selektion / Buffer
+    top_k: int
+    buffer_k: int
+
+    # Sektor-Limits
+    use_sector_limits: bool
+    max_per_sector: int | None
+
+    # Cash / Reibung / Rundung
+    include_cash: bool
+    eps: float               # absolute Friction (z.B. 0.0)
+    eps_pct: float           # prozentuale Friction (z.B. 0.0)
+    cap: float               # Turnover-Cap (0.0 = aus)
+    round_step: float        # Rundungsschritt für Gewichte
+    cost_bps: float          # z.B. 0.0 oder 5.0
+    slippage_bps: float      # z.B. 0.0 oder 0.0
+
+    # Kurs-Daten
+    adjusted: bool
+
+    # Runner-Output
+    decisions_dir: str | None
+    decision_prefix: str | None
+    dump_decision_bundles: bool
+
+    # Sonstiges
+    rebalance: str           # "monthly", "weekly", ...
+    max_lookback_days: int | None
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -46,33 +123,50 @@ class Runner:
                     pass
         return {k: v for k, v in d.items() if v > 0}
 
-    def _write_decision_bundle(self, as_of: str, old_w: dict[str, float], new_w: dict[str, float]) -> Path:
-        def with_cash(w: dict[str, float]) -> dict[str, float]:
-            s = float(sum(w.values()));
-            out = dict(w)
-            if s < 1.0:
-                out["CASH"] = max(0.0, 1.0 - s)
-            elif s > 1.0 and s > 0.0:
-                out = {k: v / s for k, v in out.items()}
-            return out
-
-        ow, nw = with_cash(old_w), with_cash(new_w)
-        keys = set(ow) | set(nw)
-        turnover = 0.5 * sum(abs(nw.get(k, 0.0) - ow.get(k, 0.0)) for k in keys)
-        bundle = {
-            "as_of": as_of,
-            "old_weights": {k: round(float(v), 6) for k, v in sorted(ow.items())},
-            "new_weights": {k: round(float(v), 6) for k, v in sorted(nw.items())},
-            "turnover": round(turnover, 6),
-            "source": "RUN",
-        }
-        ddir = Path(self.cfg.decisions_dir);
+    def _write_decision_bundle(self, as_of_raw, old_w, new_w) -> None:
+        """
+        Schreibt das Runner-Decision-Bundle als JSON.
+        Stellt sicher, dass:
+          - as_of in der JSON = 'YYYY-MM-DD'
+          - Dateiname keine ungültigen Zeichen (Windows) enthält.
+        """
+        prefix = getattr(self.cfg, "decision_prefix", "RUN")
+        ddir = Path(getattr(self.cfg, "decisions_dir", "aktien_oop/decisions"))
         ddir.mkdir(parents=True, exist_ok=True)
-        rid = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        out = ddir / f"{self.cfg.decision_prefix}_{rid}_{as_of}.json"
-        out.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[DECISION] wrote {out}")
-        return out
+
+        # 1) as_of normalisieren → immer YYYY-MM-DD
+        try:
+            as_of_ts = pd.Timestamp(as_of_raw)
+            as_of_str = as_of_ts.strftime("%Y-%m-%d")
+        except Exception:
+            # Fallback, falls wirklich etwas Exotisches reinkommt
+            as_of_str = str(as_of_raw)
+            as_of_str = (
+                as_of_str.replace(" ", "_")
+                .replace(":", "-")
+                .replace("/", "-")
+            )
+
+        # 2) Laufzeit-Stamp für eindeutige Dateinamen
+        run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 3) Bundle aufbauen – as_of als Datum-String
+        bundle = {
+            "kind": "RUN",
+            "run_id": f"{prefix}_{run_ts}",
+            "as_of": as_of_str,
+            "old_weights": _series_to_dict(old_w),
+            "new_weights": _series_to_dict(new_w),
+        }
+
+        # 4) Dateiname nur mit sauberem Datumsteil
+        out = ddir / f"{prefix}_{run_ts}_{as_of_str}.json"
+
+        out.write_text(
+            dumps(bundle, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logging.info("[DECISION] wrote %s", out)
 
     def load_tickers(self) -> List[str]:
         """Liest das Universum aus Datei und normalisiert Yahoo-kompatibel."""
@@ -149,6 +243,127 @@ class Runner:
         print("\nBestehende Positionen:\n")
         print(pos[[c for c in cols if c in pos.columns]])
 
+    # -------------------------
+    # Config / Params Helpers
+    # -------------------------
+
+    def _normalize_cfg(self, as_of_str: str | None = None) -> dict:
+        """
+        Liest runner_config.toml-/strategy.toml-Abschnitte zusammen und berechnet
+        lokale, nicht-mutable Normalized-Parameter.
+        Rückgabe ist ein dict, NICHT self.cfg mutieren.
+        """
+        cfg = self.cfg
+
+        def _sec_get(section, key, default):
+            """Hilfshelper: funktioniert sowohl für dict als auch für einfache Objekte."""
+            if section is None:
+                return default
+            if isinstance(section, dict):
+                return section.get(key, default)
+            return getattr(section, key, default)
+
+        core_cfg = getattr(cfg, "core", None)
+        win_cfg = getattr(cfg, "windows", None)
+        lim_cfg = getattr(cfg, "limits", None)
+        reb_cfg = getattr(cfg, "rebalance", None)
+
+        # Zeitraum
+        period = _sec_get(core_cfg, "period", getattr(cfg, "period", "800d"))
+
+        # as_of-Priorität: CLI → [core].as_of → cfg.as_of
+        as_of = (
+                as_of_str
+                or _sec_get(core_cfg, "as_of", getattr(cfg, "as_of", None))
+        )
+
+        # Fenster
+        score_days = int(_sec_get(win_cfg, "score_days", getattr(cfg, "score_days", 252)))
+        vol_days = int(_sec_get(win_cfg, "vol_days", getattr(cfg, "vol_days", 63)))
+
+        # Sektor-Limits
+        use_sector_limits = bool(_sec_get(lim_cfg, "use_sector_limits", getattr(cfg, "use_sector_limits", True)))
+        max_per_sector = _sec_get(lim_cfg, "max_per_sector", getattr(cfg, "max_per_sector", 3))
+
+        # Rebalance-Frequenz
+        rebalance_frequency = _sec_get(reb_cfg, "frequency", getattr(cfg, "rebalance_frequency", "monthly"))
+
+        return dict(
+            period=period,
+            as_of=as_of,
+            score_days=score_days,
+            vol_days=vol_days,
+            use_sector_limits=use_sector_limits,
+            max_per_sector=max_per_sector,
+            rebalance_frequency=rebalance_frequency,
+        )
+
+    def _build_params(self, norm: dict) -> "CalcParams":
+        """
+        Baut CalcParams ausschließlich aus norm + cfg.
+        norm kommt aus _normalize_cfg() und enthält z.B.:
+          - as_of (Timestamp oder String)
+          - period
+          - score_days
+          - vol_days
+          - use_sector_limits
+          - max_per_sector
+          - rebalance_frequency
+        """
+        cfg = self.cfg
+
+        # as_of aus norm sicher in "YYYY-MM-DD" umwandeln
+        as_of_val = norm["as_of"]
+        if isinstance(as_of_val, pd.Timestamp):
+            as_of_str = as_of_val.strftime("%Y-%m-%d")
+        else:
+            # falls schon String: einfach übernehmen
+            as_of_str = str(as_of_val)
+
+        # vol_days als int (CalcParams erwartet int, kein Optional)
+        vol_days_val = norm.get("vol_days", 0)
+        if vol_days_val is None:
+            vol_days_val = 0
+        vol_days_int = int(vol_days_val)
+
+        return CalcParams(
+            # Basis
+            as_of=as_of_str,
+            period=norm["period"],
+            adjusted=bool(getattr(cfg, "adjusted", True)),
+
+            score_days=int(norm["score_days"]),
+            vol_days=vol_days_int,
+
+            # Filter bleiben auf Defaults in CalcParams, außer du willst sie explizit setzen
+            # use_under_sma / sma_days / gap_filter / min_price / min_volume
+            # -> nutzen die Dataclass-Defaults
+
+            # Limits & Auswahl
+            use_sector_limits=bool(norm["use_sector_limits"]),
+            max_per_sector=(
+                int(norm["max_per_sector"])
+                if norm["max_per_sector"] is not None else None
+            ),
+            top_k=int(norm.get("top_k", cfg.top_k)),
+            buffer_k=int(norm.get("buffer_k", cfg.buffer_k)),
+
+            # Finalisierung / Sizing
+            include_cash=bool(getattr(cfg, "include_cash", False)),
+            weight_round_step=float(getattr(cfg, "weight_round_step", 0.0)),
+            max_turnover_cap=float(getattr(cfg, "max_turnover_cap", 1.0)),
+            friction_eps=float(getattr(cfg, "friction_eps", 0.0)),
+            friction_eps_pct=float(getattr(cfg, "friction_eps_pct", 0.0)),
+            cost_bps=float(getattr(cfg, "cost_bps", 0.0)),
+            slippage_bps=float(getattr(cfg, "slippage_bps", 0.0)),
+            rebalance=norm["rebalance_frequency"],
+            max_lookback_days=(
+                int(getattr(cfg, "max_lookback_days"))
+                if getattr(cfg, "max_lookback_days", None) is not None
+                else None
+            ),
+        )
+
     # ---------------------------
     # Main
     # ---------------------------
@@ -168,49 +383,43 @@ class Runner:
         # optional: run_id einmalig
         setup_logging(self.cfg.verbose, lib_debug=self.cfg.lib_debug, log_file=self.cfg.save_dir / "run.log")
 
-        # --- NORMALIZE (Runner) ---
-        def _assign(obj, name, value):
+        def _assign_attr(obj, name, value):
+            """Hilfsfunktion, die auch mit (halb-)frozen Config-Objekten klarkommt."""
             try:
-                # für evtl. frozen dataclasses
                 object.__setattr__(obj, name, value)
             except Exception:
                 setattr(obj, name, value)
 
-        cfg = self.cfg  # <— jetzt existiert es im Runner
+        # === NORMALIZE (Runner) – nur noch über _normalize_cfg ===
+        cfg = self.cfg
 
-        # Root-Keys bevorzugen; unterschiedliche TOML-Sektionen robust abholen
-        top_k = getattr(cfg, "top_k", None) or getattr(getattr(cfg, "topk", object()), "top_k", None) or 12
-        buffer_k = getattr(cfg, "buffer_k", None) or getattr(getattr(cfg, "topk", object()), "buffer_k", None) or 3
-        mps = getattr(cfg, "max_per_sector", None) or getattr(getattr(cfg, "limits", object()), "max_per_sector",
-                                                              None) or 3
-        use_sl = getattr(cfg, "use_sector_limits", None)
-        if use_sl is None:
-            use_sl = bool(mps and int(mps) > 0)
+        norm = self._normalize_cfg(as_of_str=as_of_str)
 
-        days_win = getattr(cfg, "days_win", None) or getattr(getattr(cfg, "windows", object()), "score_days",
-                                                             None) or 252
-        vol_win = getattr(cfg, "vol_win", None) or getattr(getattr(cfg, "windows", object()), "vol_days", None) or 63
-        adjusted = getattr(cfg, "adjusted", None)
-        if adjusted is None:
-            adjusted = getattr(getattr(cfg, "data", object()), "adjusted", True)
-
-        _assign(cfg, "top_k", int(top_k))
-        _assign(cfg, "buffer_k", int(buffer_k))
-        _assign(cfg, "max_per_sector", int(mps) if mps is not None else None)
-        _assign(cfg, "use_sector_limits", bool(use_sl))
-        _assign(cfg, "days_win", int(days_win))
-        _assign(cfg, "vol_win", int(vol_win))
-        _assign(cfg, "adjusted", bool(adjusted))
-        # --- /NORMALIZE ---
+        # Relevante Felder zurück ins cfg spiegeln, damit Logs/Store konsistent sind
+        _assign_attr(cfg, "score_days", int(norm["score_days"]))
+        _assign_attr(cfg, "vol_days", int(norm["vol_days"]))
+        _assign_attr(cfg, "use_sector_limits", bool(norm["use_sector_limits"]))
+        _assign_attr(cfg, "max_per_sector", (
+            int(norm["max_per_sector"]) if norm["max_per_sector"] is not None else None
+        ))
+        _assign_attr(cfg, "rebalance_frequency", norm["rebalance_frequency"])
+        _assign_attr(cfg, "period", norm["period"])
+        if norm["as_of"] is not None:
+            _assign_attr(cfg, "as_of", norm["as_of"])
 
         logging.debug(
-            "CFG: period=%s as_of=%s max_lookback_days=%s top_k=%s buffer_k=%s rebalance=%s max_per_sector=%s sector_limits=%s decisions_dir=%s prefix=%s dump=%s",
-            self.cfg.period, self.cfg.as_of, self.cfg.max_lookback_days, self.cfg.top_k, self.cfg.buffer_k, self.cfg.rebalance_frequency,
-            self.cfg.max_per_sector, self.cfg.sector_limits,
-            getattr(self.cfg, "decisions_dir", None),
-            getattr(self.cfg, "decision_prefix", None),
-            getattr(self.cfg, "dump_decision_bundles", None),
+            "CFG(normalized/TOML): period=%s as_of=%s top_k=%s buffer_k=%s "
+            "score_days=%s vol_days=%s use_sector_limits=%s max_per_sector=%s",
+            norm["period"],
+            norm["as_of"],
+            cfg.top_k,
+            cfg.buffer_k,
+            norm["score_days"],
+            norm["vol_days"],
+            norm["use_sector_limits"],
+            norm["max_per_sector"],
         )
+
 
         now = pd.Timestamp.now()
         last_dt = self.store.last_rebalance_time()
@@ -350,37 +559,90 @@ class Runner:
             return {t: sector_map.get(t, "UNKNOWN") for t in universe}
 
         # === CalcParams aus normalisierter cfg ===
-        params = CalcParams(
-            as_of=as_of_str,
-            period=getattr(self.cfg, "period", "800d"),
-            adjusted=bool(self.cfg.adjusted),
-            score_days=int(self.cfg.days_win),
-            vol_days=int(vol_days),
-            use_under_sma=bool(getattr(self.cfg, "use_under_sma", False)),
-            sma_days=int(getattr(self.cfg, "sma_days", 200)),
-            gap_filter=float(getattr(self.cfg, "gap_filter", 0.0)),
-            min_price=float(getattr(self.cfg, "min_price", 0.0)),
-            min_volume=float(getattr(self.cfg, "min_volume", 0.0)),
-            use_sector_limits=bool(self.cfg.use_sector_limits),
-            max_per_sector=getattr(self.cfg, "max_per_sector", 3),
-            top_k=int(self.cfg.top_k),
-            buffer_k=int(self.cfg.buffer_k),
-            include_cash=bool(getattr(self.cfg, "include_cash", False)),
-            weight_round_step=float(getattr(self.cfg, "weight_round_step", 0.0)),
-            max_turnover_cap=float(getattr(self.cfg, "max_turnover_cap", 1.0)),
-            friction_eps=float(getattr(self.cfg, "friction_eps", 0.0)),
-            friction_eps_pct=float(getattr(self.cfg, "friction_eps_pct", 0.0)),
+        cfg = self.cfg  # Kurzalias
+
+        # --- 1) Normalize cfg (ohne cfg zu mutieren) ---
+        norm = self._normalize_cfg(as_of_str=as_of_str)
+
+        logging.debug(
+            "CFG(normalized): period=%s as_of=%s top_k=%s buffer_k=%s score_days=%s vol_days=%s "
+            "use_sector_limits=%s max_per_sector=%s",
+            norm["period"], norm["as_of"], self.cfg.top_k, self.cfg.buffer_k,
+            norm["score_days"], norm["vol_days"],
+            norm["use_sector_limits"], norm["max_per_sector"],
         )
+
+        # --- 2) CalcParams aus norm bauen ---
+        params = self._build_params(norm)
 
         # === prev_holdings für Turnover-Buffer (aus letzter positions.csv) ===
         prev_df = self.store.load_positions()
         old_w = self._weights_from_positions(prev_df)
         prev_holdings = list(old_w.keys())
 
-        # === Gemeinsame Berechnung (identisch zum BT) ===
+        # --- DEBUG: Preismatrix prüfen ---
+        probe = _get_prices(tickers, params.as_of, params.period, params.adjusted)
+        if probe is None or probe.empty:
+            logging.error("Price matrix EMPTY. universe=%d as_of=%s period=%s adjusted=%s",
+                          len(tickers), params.as_of, params.period, params.adjusted)
+            return  # oder sauber weiterhandlen
+        else:
+            last_dt = probe.index.max()
+            if pd.Timestamp(params.as_of) > last_dt:
+                logging.warning("as_of=%s nicht im Price-Index. Verwende last_dt=%s",
+                                params.as_of, last_dt.date())
+                # >>> as_of auf letzten vorhandenen Börsentag setzen <<<
+                params = dataclasses.replace(params,  as_of=last_dt)  # bei @dataclass(frozen=False/frozen=True mit replace)
+
+            first_dt = probe.index.min()
+            non_na_cols = int((probe.notna().any(axis=0)).sum())
+            logging.debug("Price matrix shape=%s first=%s last=%s nonNaCols=%d",
+                          tuple(probe.shape), str(first_dt), str(last_dt), non_na_cols)
+
+        # Jetzt erst der Core-Call:
         weights, scores = calculate_portfolio(
             tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
         )
+
+        debug_dir = Path("aktien_oop/debug")
+        debug_dir.mkdir(exist_ok=True, parents=True)
+
+        as_of_str = params.as_of  # "YYYY-MM-DD"
+        safe_as_of = norm["as_of"]
+
+        if isinstance(scores, pd.Series):
+            df_scores = scores.to_frame(name="score_adj")
+            df_scores.index.name = "ticker"
+            df_scores = df_scores.reset_index().sort_values("score_adj", ascending=False)
+            df_scores.to_csv(debug_dir / f"RUN_scores_{safe_as_of}.csv", index=False)
+
+        # auch die finalen Gewichte dumpen
+        if isinstance(weights, dict):
+            df_w = pd.DataFrame(
+                [{"ticker": k, "weight": v} for k, v in weights.items()]
+            ).sort_values("weight", ascending=False)
+            df_w.to_csv(debug_dir / f"RUN_weights_{safe_as_of}.csv", index=False)
+
+        logging.debug(
+            "[DEBUG/RUN] calculate_portfolio -> %d Namen, Beispiele: %s",
+            len(weights),
+            list(itertools.islice(weights.items(), 0, 5)),
+        )
+
+        if not weights or sum(abs(v) for v in weights.values()) == 0.0:
+            logging.error("Core returned EMPTY weights. universe=%d  as_of=%s", len(tickers), params.as_of)
+
+        # --- DEBUG: gezielte Probe für BT-Titel ---
+        _bt_names = ["GEV", "PLTR", "STX"]
+        probe3 = _get_prices(_bt_names, params.as_of, params.period, params.adjusted)
+        if probe3 is None or probe3.empty:
+            logging.error("Probe(GEV,PLTR,STX) EMPTY")
+        else:
+            logging.debug("Probe(GEV,PLTR,STX) shape=%s last=%s cols=%s last_row=%s",
+                          tuple(probe3.shape),
+                          str(probe3.index.max()),
+                          list(probe3.columns),
+                          probe3.tail(1).to_dict(orient="records"))
 
         # === 'sel' DataFrame aus den Ergebnissen bauen (für deine Logs/Output) ===
         sel_ticks = list(weights.keys())
@@ -434,14 +696,21 @@ class Runner:
             ticks = self.load_tickers()
             univ_sha = hashlib.sha1(("|".join(sorted(map(str, ticks)))).encode()).hexdigest()
 
-            print(
-                f"[LOCKSTEP][RUN] as_of={as_of_str} "
-                f"top_k={self.cfg.top_k} buffer_k={self.cfg.buffer_k} "
-                f"use_sector_limits={(self.cfg.max_per_sector is not None and self.cfg.max_per_sector > 0) or bool(self.cfg.sector_limits)} "
-                f"max_per_sector={self.cfg.max_per_sector} "
-                f"score_days={getattr(self.cfg, 'days_win', None)} vol_days={getattr(self.cfg, 'vol_win', None)} adjusted={self.cfg.adjusted} "
-                f"universe_len={len(ticks)} sha={univ_sha}"
+            logging.info(
+                "[LOCKSTEP][RUN] as_of=%s top_k=%d buffer_k=%d use_sector_limits=%s max_per_sector=%s "
+                "score_days=%d vol_days=%d adjusted=%s universe_len=%d sha=%s",
+                norm["as_of"],
+                self.cfg.top_k,
+                self.cfg.buffer_k,
+                norm["use_sector_limits"],
+                norm["max_per_sector"],
+                norm["score_days"],
+                norm["vol_days"],
+                params.adjusted,
+                len(tickers),
+                univ_sha,
             )
+
             # --- /LOCKSTEP ---
 
             # Bundle schreiben – nutzt den oben berechneten as_of_str

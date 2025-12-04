@@ -32,6 +32,7 @@ try:
 except Exception:
     _HAS_REPORTING = False
 
+__BT_VERSION__ = "BT-2025-11-11-a"
 TRADING_DAYS = 252.0
 DAYS_PER_YEAR = 365.25
 EPS = 1e-12
@@ -93,18 +94,6 @@ class BTConfig:
 # ---------------------------------------
 # Hilfen
 # ---------------------------------------
-def safe_date_str(ts, fmt="%Y-%m-%d") -> str:
-    """Gibt ts.strftime(fmt) zurück, oder '' / None, wenn ts leer ist."""
-    if ts is None:
-        return ""
-    try:
-        ts = pd.Timestamp(ts)
-    except Exception:
-        return ""
-    if pd.isna(ts):
-        return ""
-    return ts.strftime(fmt)
-
 def _bt_write_decision_bundle(prefix, decisions_dir, as_of_str,
                               weights, ranks=None, scores=None, vol=None,
                               run_id=None, **extras):
@@ -396,7 +385,6 @@ def turnover_buffer(df_sorted: pd.DataFrame, prev: List[str], top_k: int, buffer
     add = [t for t in df_sorted["ticker"].tolist() if t not in keep]
     return keep + add[:max(0, need)]
 
-
 def inverse_vol_weights(sel: pd.DataFrame) -> pd.Series:
     v = sel["volatility"].replace([np.inf, 0], np.nan)
     if v.isna().all():
@@ -483,6 +471,17 @@ class Backtester:
             print(msg)
 
     def run(self):
+        print(f"[BT] version={__BT_VERSION__}")
+        # --- Self-fingerprint: sicherstellen, dass wir denselben Code sehen ---
+        try:
+            this_path = Path(__file__)
+            bt_sha1 = hashlib.sha1(this_path.read_bytes()).hexdigest()
+            print(f"[BT] file_sha1={bt_sha1}  py={sys.version.split()[0]}  os={platform.system()}-{platform.release()}")
+        except Exception:
+            pass
+
+        # --- /Self-fingerprint ---
+
         def _first(*vals, default=None):
             for v in vals:
                 if v is not None:
@@ -809,30 +808,40 @@ class Backtester:
                 continue
 
             # Scoring + Filter
-            # ===== Gemeinsame Kernberechnung (Core-Calc) =====
+            # === Rebalance via Core (einheitlicher Pfad) ===
 
-            # 1) Callbacks: gleiche Datenquelle wie sonst im BT
-            def _get_prices_bt(universe, as_of, period, adjusted):
-                """Liefert Preload-Slice (keine Downloads in der Schleife)."""
-                as_of_ts = pd.Timestamp(as_of).tz_localize(None)
-                days = _period_to_days(period)
-                start_ts = as_of_ts - pd.Timedelta(days=days)
-                cols = [c for c in universe if c in prices_all.columns]
-                if not cols:
-                    return prices_all.iloc[0:0]
-                return prices_all.loc[(prices_all.index > start_ts) & (prices_all.index <= as_of_ts), cols]
+            # 1) Universe & Snapshots
+            universe = list(valid_cols)  # valid_cols kommt direkt oberhalb aus deinem Preload
+            _old_weights_snapshot = cur_weights.to_dict() if isinstance(cur_weights, pd.Series) else {}
 
-            def _get_sectors_bt(universe: list[str]) -> dict[str, str]:
+            prev_holdings = [t for t, w in _old_weights_snapshot.items() if float(w) > 0.0 and t != "CASH"]
+
+            # 2) Preis-/Sektor-Callbacks für Core
+            # 2) Preis-/Sektor-Callbacks für Core
+            def _get_prices_bt(tickers, as_of, period, adjusted=True):
                 """
-                Map von Ticker -> Sektor auf Basis deines bereits geladenen secmap.
-                Fällt auf 'UNKNOWN' zurück, wenn kein Eintrag vorhanden ist.
+                Vom Core aufgerufen als get_prices(universe, p.as_of, p.period, p.adjusted)
+                → as_of: Enddatum (YYYY-MM-DD), period: Lookback z.B. '800d'
                 """
-                return {t: secmap.get(t, "UNKNOWN") for t in universe}
+                _idx = prices_all.index
+                _asof = pd.Timestamp(as_of)
+                _days = _period_to_days(period)  # '800d' → 800
+                _start = _asof - pd.Timedelta(days=_days)
 
-            # 2) CalcParams aus cfg (nur erlaubte Felder!)
+                # auf vorhandene Indizes klemmen
+                _start = _idx[_idx.get_indexer([_start], method="backfill")[0]]
+                _end = _idx[_idx.get_indexer([_asof], method="pad")[0]]
+
+                frame = prices_all.loc[_start:_end, list(tickers)].copy()
+                return frame
+
+            def _get_sectors_bt(tickers):
+                return {t: secmap.get(t, "UNKNOWN") for t in tickers}
+
+            # 3) CalcParams aus cfg
             _asof_str = d.strftime("%Y-%m-%d")
             cp = CalcParams(
-                as_of=_asof_str,
+                as_of=d.strftime("%Y-%m-%d"),
                 period=getattr(self.cfg, "period", "800d"),
                 adjusted=bool(adjusted),
                 score_days=int(score_days),
@@ -847,7 +856,7 @@ class Backtester:
 
                 # Limits & Auswahl
                 use_sector_limits=bool(use_sector_limits),
-                max_per_sector=getattr(self.cfg, "max_per_sector", 3),
+                max_per_sector=int(self.cfg.max_per_sector),
                 top_k=int(self.cfg.top_k),
                 buffer_k=int(self.cfg.buffer_k),
 
@@ -859,161 +868,91 @@ class Backtester:
                 friction_eps_pct=float(getattr(self.cfg, "friction_eps_pct", 0.0)),
             )
 
-            # 3) Universe = valid_cols (hat Mindesthistorie)
-            universe = list(valid_cols)
-
-            # Für Buffer: bisherige Holdings aus cur_weights
-            if hasattr(cur_weights, "index"):
-                prev_holdings = list(cur_weights.index)
-            elif isinstance(cur_weights, dict):
-                prev_holdings = list(cur_weights.keys())
-            else:
-                prev_holdings = []
-
-            universe = list(valid_cols)  # identisches Universe in BT & Runner
-
-            # --- Snapshot der alten Gewichte VOR dem Rebalance (für Turnover) ---
-            if hasattr(cur_weights, "to_dict"):
-                _old_weights_snapshot = cur_weights.to_dict()
-            elif isinstance(cur_weights, dict):
-                _old_weights_snapshot = dict(cur_weights)
-            else:
-                _old_weights_snapshot = {}
-            # --------------------------------------------------------------------
-
-            # 4) Kernberechnung: liefert (weights_dict, scores_series)
+            # 4) Core-Call (Selektion/Ranks/Scores)
             new_w_dict, scores_ser = calculate_portfolio(
-                universe, cp, _get_prices_bt, _get_sectors_bt, prev_holdings=prev_holdings
+                universe,
+                cp,
+                _get_prices_bt,
+                _get_sectors_bt,
+                prev_holdings=prev_holdings,
             )
 
-            # --- Turnover/Cost auf Basis des Snapshots (_old_weights_snapshot) ---
+            # >>> DEBUG-DUMP NUR FÜR LOCKSTEP-TAG 2025-10-08
+            if d.strftime("%Y-%m-%d") == "2025-10-08":
+                self._dbg(f"[BT/DBG] as_of={d} universe_len={len(universe)} examples={list(universe)[:10]}")
+                self._dbg(
+                    f"[BT/DBG] scores_nonNa={scores_ser.dropna().sort_values(ascending=False).head(15).to_dict()}")
+                self._dbg(f"[BT/DBG] new_w_dict={dict(sorted(new_w_dict.items(), key=lambda x: -x[1])[:15])}")
+            # <<< DEBUG-DUMP ENDE
+
+            # 5) Turnover/Cost EINMAL (alt vs. neu) — vor cur_weights-Update!
             _old = pd.Series(_old_weights_snapshot, dtype=float)
             _new = pd.Series(new_w_dict, dtype=float)
             aligned = pd.concat([_old, _new], axis=1).fillna(0.0)
             aligned.columns = ["old", "new"]
-
             raw_turnover = float((aligned["old"] - aligned["new"]).abs().sum() / 2.0)
 
-            _cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            _cap = float(self.cfg.max_turnover_cap or 0.0)
             turnover_eff = min(raw_turnover, _cap) if _cap > 0.0 else raw_turnover
 
             _cost_bps = float(getattr(self.cfg, "cost_bps", 0.0) or 0.0)
             _slip_bps = float(getattr(self.cfg, "slippage_bps", 0.0) or 0.0)
             trade_cost = turnover_eff * ((_cost_bps + _slip_bps) / 10000.0)
-            # -------------------------------------------------------
 
-            # As-Of & nächster Stichtag
-            as_of_ts = pd.Timestamp(d)
-            try:
-                d_next_ts = pd.Timestamp(rdates[i + 1])
-            except Exception:
-                d_next_ts = as_of_ts  # letzter Punkt (keine Zukunft)
+            # 6) cur_weights setzen (nach Turnover-Berechnung)
+            cur_weights = pd.Series(new_w_dict, dtype=float)
+            cur_weights = cur_weights.sort_index()
+            cur_holdings = list(cur_weights.index)
 
-            # under_sma (z. B. 200d)
-            last_close_s = prices_all.loc[:as_of_ts].iloc[-1]
-            sma_ref_s = sma200_all.loc[:as_of_ts].iloc[-1]
-            under_sma_s = (last_close_s < sma_ref_s)
-            under_sma_s = pd.Series(under_sma_s, index=prices_all.columns).astype("boolean")
-
-            # gap 1d
-            gap_1d_s = rets_all.loc[:as_of_ts].iloc[-1].abs() > 0.12
-            gap_1d_s = pd.Series(gap_1d_s, index=prices_all.columns).astype("boolean")
-
-            # Monats-Returns d -> d_next
-            ret_mask = (rets_all.index > as_of_ts) & (rets_all.index <= d_next_ts)
-            rets_sub = rets_all.loc[ret_mask, :]
-
-            # Gewichte/Portfolio-Return
-            new_weights = new_w_dict.copy()
-            cur_weights = pd.Series(new_weights, dtype=float)
-            if "CASH" in cur_weights.index:
-                cur_weights = cur_weights.drop("CASH")
-            avail = [c for c in cur_weights.index if c in rets_sub.columns]
-            w = cur_weights.reindex(avail, fill_value=0.0)
-            base_port_rets = (rets_sub[avail] * w[avail]).sum(axis=1) if len(avail) else pd.Series(0.0,
-                                                                                                   index=rets_sub.index)
-
-            cur_holdings = list(cur_weights.sort_values(ascending=False).index)
-            eff_new = cur_weights.copy()
-
-            # === Variablen wie bisher bereitstellen ===
-
-            # a) 'sel' DataFrame für Logs/Ansicht
-            _sel_ticks = list(new_w_dict.keys())
-            sel = pd.DataFrame({"ticker": _sel_ticks})
-            # Score für Anzeige/Ranking (Name wie bisher genutzt)
-            sel["score_adj"] = sel["ticker"].map(lambda t: float(scores_ser.get(t, np.nan)))
-            sel["rank"] = sel["score_adj"].rank(ascending=False, method="first").astype("Int64")
-            sel["allocation_pct"] = sel["ticker"].map(lambda t: round(100.0 * float(new_w_dict.get(t, 0.0)), 2))
-            if secmap:
-                sel["sector"] = sel["ticker"].map(secmap).fillna("UNKNOWN")
-
-            # optional: visuelle Rundung gemäß weight_round_step
-            _step = float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0)
-            if _step > 0:
-                sel["allocation_pct"] = (sel["allocation_pct"] / _step).round() * _step
-                _sum = float(sel["allocation_pct"].sum())
-                if _sum > 0:
-                    sel["allocation_pct"] = sel["allocation_pct"] * (100.0 / _sum)
-
-            # b) alte/neue Gewichte als Series/Dict, sortiert
-            # b) Anzeige/Debug – keine Turnover-Neuberechnung mehr
-            # === Folgende Variablen werden unten benötigt ===
-            # sel, new_w_dict, ranks_dict, scores_dict, vol_dict, turnover_eff, trade_cost
-            filt_stats = locals().get("filt_stats", {})
-            if getattr(self.cfg, "verbose", False):
-                _holdings_list = list(new_w_dict.keys())
-                print(f"{d} holdings={_holdings_list} turnover_eff={float(turnover_eff):.3f} "
-                      f"cost={float(trade_cost):.4f} eq={equity_val:.4f} filt={filt_stats}")
-
-            # === Folgende Variablen werden unten benötigt ===
-            # finale (effektive) Gewichte für Bundle/Logs:
-            eff_new = cur_weights.copy()
-
-            # Rückrechnungs-Fenster d -> d_next für Ertragsfortschreibung:
+            # Renditefenster d -> d_next für aktuell gewählte Aktien
             ret_mask = (feats["rets"].index > d) & (feats["rets"].index <= d_next)
-
-            # Nur Aktien (CASH ausschließen)
             stock_holdings = [t for t in cur_holdings if t != "CASH"]
 
-            # Teil-Returnmatrix (robust behandeln, falls leer)
             if stock_holdings:
                 rets_sub = feats["rets"].loc[ret_mask, stock_holdings].replace([np.inf, -np.inf], np.nan).fillna(0.0)
             else:
                 rets_sub = pd.DataFrame(index=feats["rets"].index[ret_mask])
 
-            # Gewichte der Aktienseite (CASH hat keine Renditen in feats["rets"])
-            w_stocks = cur_weights.reindex(stock_holdings).fillna(0.0) if stock_holdings else pd.Series(dtype=float)
+            # 7) Rankings/Scores/Vol fürs Bundle
+            try:
+                # Holdings aus den neuen Gewichten
+                cur_holdings = list(new_w_dict.keys())
 
-            # Basis-Return der Aktienseite für die Fortschreibung
-            base_port_rets = rets_sub.dot(w_stocks) if not rets_sub.empty else pd.Series(0.0, index=rets_sub.index)
+                # Scores aus dem Core-Call auf genau diese Holdings abbilden
+                _scores = None
+                try:
+                    if scores_ser is not None and len(scores_ser) > 0:
+                        _scores = scores_ser.reindex(cur_holdings).astype(float)
+                except Exception:
+                    _scores = None
 
-            # f) optionale Dicts für Bundle
-            ranks_dict = sel.set_index("ticker")["rank"].dropna().astype(int).to_dict()
-            scores_dict = sel.set_index("ticker")["score_adj"].dropna().astype(float).to_dict()
-            vol_dict = {}  # kannst du später befüllen
+                # Dicts robust bauen
+                if _scores is not None:
+                    scores_dict = _scores.round(6).to_dict()
+                    ranks_dict = _scores.rank(method="first", ascending=False).astype(int).to_dict()
+                else:
+                    scores_dict = {t: float("nan") for t in cur_holdings}
+                    ranks_dict = {t: int(1) for t in cur_holdings}  # Fallback
+                # Vol kann später ergänzt werden
+                vol_dict = {}
 
-            # g) Filter-Statistik für Logs (falls später referenziert)
-            filt_stats = {}
-            # ===== /Gemeinsame Kernberechnung =====
+                # Filter-Stats für Debug/Prints defensiv bereitstellen
+                filt_stats = locals().get("filt_stats", {})
+
+            except Exception:
+                sel_idx = None
 
             # Kosten einmalig am Rebalance-Tag buchen
             equity_val *= (1.0 - trade_cost)
             equity_rows.append({"date": pd.Timestamp(d), "equity": equity_val})
 
-            # --- Trades-Log (für Avg Turnover/Cost) ---
-            # --- Trades-Log (nur am Rebalance-Tag) ---
-            try:
-                _old_ws = _old_weights_snapshot if isinstance(_old_weights_snapshot, dict) else {}
-            except NameError:
-                _old_ws = {}
-            _new_ws = new_w_dict if isinstance(new_w_dict, dict) else {}
-
+            # --- Trades-Log (nur Rebalance-Tag) ---
+            _old_ws = _old_weights_snapshot
+            _new_ws = new_w_dict
             old_set = {t for t, w in _old_ws.items() if t != "CASH" and float(w) > 0.0}
             new_set = {t for t, w in _new_ws.items() if t != "CASH" and float(w) > 0.0}
-
-            turn_for_log = float(locals().get("turnover", locals().get("turnover_eff", 0.0)))
             date_str = pd.Timestamp(d).strftime("%Y-%m-%d")
+            turn_for_log = float(locals().get("turnover_eff", locals().get("turnover", 0.0)))
 
             trades_log.append({
                 "date": date_str,
@@ -1048,15 +987,36 @@ class Backtester:
                     equity_val *= (1.0 + float(r))
                     equity_rows.append({"date": pd.Timestamp(idx), "equity": equity_val})
 
-            # Positionen loggen
-            tmp = sel.copy()
-            tmp.insert(0, "as_of", d.strftime("%Y-%m-%d"))
+            # Quelle: new_w_dict (Gewichte), scores_dict, ranks_dict
+            pos_rows = []
+            for t, w in new_w_dict.items():
+                pos_rows.append({
+                    "ticker": t,
+                    "weight": float(w),
+                    "score": float(scores_dict.get(t, float("nan"))) if scores_dict else float("nan"),
+                    "rank": int(ranks_dict.get(t, 0)) if ranks_dict else 0,
+                })
+
+            tmp = pd.DataFrame(pos_rows)
+            # as_of-Spalte vorn einfügen
+            tmp.insert(0, "as_of", pd.Timestamp(d).strftime("%Y-%m-%d"))
+
+            # Sektoren zuordnen (falls secmap existiert)
             if secmap:
                 tmp["sector"] = tmp["ticker"].map(secmap).fillna("UNKNOWN")
+            else:
+                tmp["sector"] = "UNKNOWN"
+
+            # CASH sauber labeln
             tmp.loc[tmp["ticker"] == "CASH", "sector"] = "CASH"
+
+            # optional schön sortieren (erst Gewicht, dann Rank)
+            # tmp = tmp.sort_values(by=["weight", "rank"], ascending=[False, True], ignore_index=True)
+
             positions_log.append(tmp)
 
             # Debug-Ausgabe (self._dbg checkt verbose selbst)
+            filt_stats = locals().get("filt_stats", {"gap": None, "under_sma": None})
             self._dbg(
                 f"{d.date()} holdings={cur_holdings} turnover_eff={turn_for_log:.3f} "
                 f"cost={trade_cost:.4f} eq={equity_val:.4f} filt={filt_stats}"
@@ -1079,7 +1039,7 @@ class Backtester:
 
                 # Roh-/Eff-Turnover robust aus locals
                 _t_raw = float(locals().get("raw_turnover", float("nan")))
-                _t_eff = float(locals().get("turnover", float("nan")))
+                _t_eff = float(locals().get("turnover_eff", float("nan")))
 
                 # Alte Gewichte als Series für das Bundle (vor dem Rebalance)
                 try:
@@ -1088,6 +1048,9 @@ class Backtester:
                     _old_ws_dict = {}
                 old_sorted = pd.Series(_old_ws_dict, dtype=float)
                 old_sorted = old_sorted.reindex(sorted(old_sorted.index)).fillna(0.0).sort_values(ascending=False)
+
+                # finale Gewichte als sortierte Series fürs Bundle
+                eff_new = cur_weights.sort_values(ascending=False)
 
                 bundle = {
                     "run_id": getattr(self, "_run_id", None),
@@ -1143,11 +1106,9 @@ class Backtester:
                     decisions_dir=str(_ddir),
                     as_of_str=_asof_ts.strftime("%Y-%m-%d"),
                     weights=_series_to_dict(eff_new),
-                    ranks=(_series_to_dict(sel.set_index("ticker")["rank"]) if "rank" in sel.columns else None),
-                    scores=(
-                        _series_to_dict(sel.set_index("ticker")["score_adj"]) if "score_adj" in sel.columns else None),
-                    vol=(_series_to_dict(
-                        sel.set_index("ticker")["volatility"]) if "volatility" in sel.columns else None),
+                    ranks=(ranks_dict if isinstance(ranks_dict, dict) and ranks_dict else None),
+                    scores=(scores_dict if isinstance(scores_dict, dict) and scores_dict else None),
+                    vol=(vol_dict if isinstance(vol_dict, dict) and vol_dict else None),
                     run_id=_rid_str or None,
                     # alles darunter sind deine bisherigen Zusatzfelder aus "bundle":
                     top_k=int(self.cfg.top_k),
@@ -1166,7 +1127,7 @@ class Backtester:
                     old_weights=_series_to_dict(old_sorted),
                     new_weights=_series_to_dict(eff_new),
                     turnover_raw=float(locals().get("raw_turnover", float("nan"))),
-                    turnover_eff=float(locals().get("turnover", float("nan"))),
+                    turnover_eff=float(locals().get("turnover_eff", float("nan"))),
                     holdings=list(eff_new.sort_values(ascending=False).index),
                 )
 

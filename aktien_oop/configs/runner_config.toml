@@ -5,20 +5,30 @@ top_k = 12
 buffer_k = 3
 use_sector_limits = true
 max_per_sector = 3
-days_win = 252
-vol_win = 63
 adjusted = true
+
+# Logging & Bundles
+dump_decision_bundles = true
+decisions_dir = "aktien_oop/decisions"
+decision_prefix = "RUN"
+save_dir = "aktien_oop"
+tickers_file = "aktien_oop/sp500_tickers.txt"
+sector_meta = "aktien_oop/sp500_meta.csv"
 
 [core]
 period = "800d"
-as_of = "2025-10-09"
+as_of = "2025-10-08"
+
+[windows]
+score_days = 200
+vol_days   = 63
 
 [topk]
 top_k = 12
 buffer_k = 3
 
 [rebalance]
-rebalance = "monthly"
+frequency  = "monthly"
 
 [limits]
 use_sector_limits = true
@@ -29,21 +39,27 @@ days_win = 130
 gap_th = 0.15
 adv_min_dollars = 5000000
 
+# Filter erstmal entschärfen
+min_price  = 0.0
+min_volume = 0.0
+
+# Gewichtung & Reibung exakt wie im BT (falls du magst)
+friction_eps       = 0.0015
+friction_eps_pct   = 0.00
+weight_round_step  = 0.01
+max_turnover_cap   = 0.40
+
+# Cash & Kosten kannst du optional anpassen;
+# fürs Matching sind sie nachrangig, aber schaden nicht:
+include_cash     = true
+cost_bps         = 0
+slippage_bps     = 7.0
+
 max_lookback_days = 720
-
-# Logging & Bundles
-dump_decision_bundles = true
-decisions_dir = "aktien_oop/decisions"
-decision_prefix = "RUN"
-save_dir = "aktien_oop"
-
-tickers_file = "aktien_oop/sp500_tickers.txt"
-sector_meta_file = "aktien_oop/sp500_meta.csv"
 
 verbose = true
 force_rebalance = true
 use_equal_weight = false
-weight_round_step = 0.01
 
 [filters]
 gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)

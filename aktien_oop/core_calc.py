@@ -32,7 +32,10 @@ class CalcParams:
     max_turnover_cap: float = 1.0
     friction_eps: float = 0.0
     friction_eps_pct: float = 0.0
-
+    cost_bps: float = 0.0
+    slippage_bps: float = 0.0
+    rebalance: str = "monthly"
+    max_lookback_days: int  = None
 
 # Signaturen für die Injektionsfunktionen
 GetPricesFn  = Callable[[Sequence[str], str, str, bool], pd.DataFrame]
@@ -194,63 +197,62 @@ def _xs_rank01(s: pd.Series) -> pd.Series:
     # Cross-Section-Rank 0..1 (höher besser) – wie im BT
     return s.rank(pct=True)
 
-def compute_scores(prices: pd.DataFrame, p: CalcParams) -> pd.Series:
+def compute_scores(close: pd.DataFrame, p: CalcParams) -> pd.Series:
     """
-    BT-kompatible Score-Berechnung:
-      score = 0.50 * rank(mom12_1) + 0.25 * rank(mom126) + 0.25 * rank(mom63)
-      under_sma = Close < SMA(100)  → penalty = 0.15
-      score_adj = score - penalty
-    Rückgabe: score_adj (Series: index=ticker, value=float)
+    Scoring-Logik für BT und Runner:
+    - Verwendet p.score_days dynamisch (statt starr 252)
+    - Kombiniert drei Momenta (kurz/mittel/lang) + Under-SMA-Penalty
     """
-    close = _to_close_matrix(prices)
-    if close.empty:
-        return pd.Series(dtype=float)
 
-    # bis as_of clippen (robust falls as_of nicht exakt im Index ist)
-    as_of_ts = pd.Timestamp(p.as_of).tz_localize(None)
-    close = close.loc[:as_of_ts]
-    if len(close) < 253:  # 252 + 1 für mom12_1
+    # ---- Minimal benötigte Historie ----
+    # Lange Window = score_days (z.B. 200 oder 252)
+    long_win = max(p.score_days, 63)
+    mid_win  = max(p.score_days // 2, 21)
+    short_win = max(p.score_days // 4, 10)
+
+    # +21 Tage, da wir für das "12M ohne letzten Monat" eine Verschiebung brauchen
+    min_rows = long_win + 21
+    if len(close) < min_rows:
+        # Zu wenig Historie -> alle Scores NaN -> wird später rausgefiltert
         return pd.Series(index=close.columns, dtype=float)
 
-    # Features wie im BT:
-    # mom63 / mom126 / mom252
-    mom63  = close / close.shift(63)  - 1.0
-    mom126 = close / close.shift(126) - 1.0
-    # mom12_1: 12M Momentum ohne letzten Monat
-    mom12_1 = close.shift(21) / close.shift(252) - 1.0
-    # SMA100 für under_sma
-    sma100 = close.rolling(100, min_periods=100).mean()
+    # ---- Momentum-Features ----
+    # Kurz: z.B. ~score_days/4
+    mom_short = close / close.shift(short_win) - 1.0
+    # Mittel: z.B. ~score_days/2
+    mom_mid   = close / close.shift(mid_win)   - 1.0
+    # Lang: "12M ohne letzten Monat" analog, aber mit long_win statt fest 252
+    mom_long  = close.shift(21) / close.shift(long_win) - 1.0
 
-    # Letzte verfügbare Zeile (<= as_of)
-    r63    = _xs_rank01(mom63.iloc[-1])
-    r126   = _xs_rank01(mom126.iloc[-1])
-    r12_1  = _xs_rank01(mom12_1.iloc[-1])
+    # Letzte verfügbare Zeile
+    r_short = _xs_rank01(mom_short.iloc[-1])
+    r_mid   = _xs_rank01(mom_mid.iloc[-1])
+    r_long  = _xs_rank01(mom_long.iloc[-1])
 
-    score = 0.50 * r12_1 + 0.25 * r126 + 0.25 * r63
+    # Gewichtung wie im BT (lang dominiert)
+    score = 0.50 * r_long + 0.25 * r_mid + 0.25 * r_short
+
+    # ---- Under-SMA-Filter (für Penalty) ----
+    # SMA-Fenster: mindestens 100, sonst halbe score_days
+    sma_win = max(100, mid_win)
+    sma = close.rolling(sma_win, min_periods=sma_win).mean()
 
     last_close = close.iloc[-1]
-    sma_last   = sma100.iloc[-1]
-    # Ticker-Index festlegen (Scores ist bei uns die Referenz)
-    # Referenzindex
-    tickers = list(score.index)  # oder score.index, je nach Variable bei dir
+    sma_last   = sma.iloc[-1]
 
-    # Align beider Eingaben
-    last_close_s = (last_close if isinstance(last_close, pd.Series)
-                    else pd.Series(last_close, index=tickers)).reindex(tickers)
-    sma_last_s = (sma_last if isinstance(sma_last, pd.Series)
-                  else pd.Series(sma_last, index=tickers)).reindex(tickers)
+    tickers = score.index
 
-    # Vergleich -> sicherstellen, dass es eine pandas Series ist
+    last_close_s = last_close.reindex(tickers)
+    sma_last_s   = sma_last.reindex(tickers)
+
     comp = (last_close_s < sma_last_s)
     if not isinstance(comp, pd.Series):
         comp = pd.Series(comp, index=tickers)
 
-    # Nullable-Boolean erzwingen, dann fehlende als True auffüllen
     under_sma = comp.astype("boolean").fillna(True)
+    penalty   = 0.15 * under_sma.astype(int)
 
-    penalty   = 0.15 * under_sma.astype(int)  # exakt wie im BT
     score_adj = (score - penalty).astype(float)
-
     return score_adj
 
 

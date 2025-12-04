@@ -1,5 +1,4 @@
 from typing import Optional
-from pathlib import Path
 import yfinance as yf
 import pandas as pd
 from .config import Config, normalize_ticker
@@ -90,3 +89,63 @@ class DataClient:
                      f"{'über' if last_close > last_sma else 'unter'} 200DMA")
         return last_close > last_sma
 
+    def _period_to_days(period: str) -> int:
+        """Akzeptiert '800d', '36m', '5y' etc. und liefert Tage (grobe Umrechnung)."""
+        if period is None:
+            return 800
+        p = str(period).strip().lower()
+        try:
+            if p.endswith("d"):
+                return int(p[:-1])
+            if p.endswith("m"):
+                return int(p[:-1]) * 30
+            if p.endswith("y"):
+                return int(p[:-1]) * 365
+            # nackte Zahl → Tage
+            return int(p)
+        except Exception:
+            return 800
+
+    def get_prices(self, universe, as_of, period, adjusted=True) -> pd.DataFrame:
+        def _period_to_days(p: str) -> int:
+            if p is None: return 800
+            s = str(p).strip().lower()
+            try:
+                if s.endswith("d"): return int(s[:-1])
+                if s.endswith("m"): return int(s[:-1]) * 30
+                if s.endswith("y"): return int(s[:-1]) * 365
+                return int(s)
+            except Exception:
+                return 800
+
+        cutoff = pd.Timestamp(as_of).tz_localize(None) if as_of else None
+        lookback_days = _period_to_days(period)
+
+        series_list = []
+        for t in universe:
+            df = self.download_ohlc(t)
+            if df is None or df.empty: continue
+            idx = pd.to_datetime(df.index).tz_localize(None)
+            df = df.set_index(idx)
+            if adjusted and "Adj Close" in df.columns:
+                col = "Adj Close"
+            elif "Close" in df.columns:
+                col = "Close"
+            else:
+                continue
+            s = df[col].rename(t)
+            if cutoff is not None:
+                start = cutoff - pd.Timedelta(days=lookback_days)
+                s = s.loc[(s.index >= start) & (s.index <= cutoff)]
+            if s.empty: continue
+            series_list.append(s)
+
+        if not series_list:
+            return pd.DataFrame()
+
+        mat = pd.concat(series_list, axis=1).sort_index()
+        mat = mat.dropna(how="all")
+        return mat
+
+    def load_prices(self, universe, as_of, period, adjusted=True):
+        return self.get_prices(universe, as_of, period, adjusted)

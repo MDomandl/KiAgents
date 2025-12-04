@@ -6,7 +6,7 @@ use_sector_limits = true
 max_per_sector = 3
 adjusted = true
 
-as_of  = "2025-10-10"
+as_of  = "2025-10-09"
 
 # --- Decision Bundles ---
 dump_decision_bundles = true
@@ -82,5 +82,5 @@ period = "800d"
 as_of  = "2025-10-10"
 
 [windows]
-score_days = 252
+score_days = 200
 vol_days   = 63

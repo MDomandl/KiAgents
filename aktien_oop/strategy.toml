@@ -14,7 +14,7 @@ sma_window   = 200
 require_above_sma = true
 
 [windows]
-score_days = 252
+score_days = 200
 vol_days   = 63
 
 [data]

@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import logging
 from sklearn.linear_model import LinearRegression
 from collections import Counter
 from datetime import datetime
@@ -110,24 +111,25 @@ def mom_12_1(close: pd.Series) -> Optional[float]:
     except Exception:
         return None
 
-def sp500_above_200dma() -> bool:
-    df = yf.download("^GSPC", period="250d", interval="1d",
-                     progress=False, auto_adjust=ADJUSTED, threads=False)
+def sp500_above_200dma(self) -> bool:
+    # Ende = as_of, Start = as_of - 300 Kalendertage (genug für 200DMA)
+    as_of_ts = pd.Timestamp(self.cfg.as_of).normalize() if getattr(self.cfg, "as_of", None) else pd.Timestamp.today().normalize()
+    start_s  = (as_of_ts - pd.Timedelta(days=300)).strftime("%Y-%m-%d")
+    end_s    = as_of_ts.strftime("%Y-%m-%d")
+
+    df = yf.download("^GSPC", start=start_s, end=end_s, interval="1d",
+                     progress=False, auto_adjust=self.cfg.adjusted, threads=False)
     if df is None or df.empty or "Close" not in df.columns:
-        print("S&P 500: keine Daten erhalten.")
-        return False
-
-    close = _as_series(df["Close"], "Close").dropna()
+        logging.warning("S&P 500: keine Daten erhalten."); return False
+    close = pd.Series(df["Close"]).dropna()
     if len(close) < 200:
-        print(f"S&P 500: nur {len(close)} gültige Close-Werte — 200DMA nicht möglich.")
-        return False
-
+        logging.warning("S&P 500: zu wenige Close-Werte für 200DMA."); return False
     sma200 = close.rolling(200).mean().dropna()
-    last_close = float(close.iloc[-1])
-    last_sma   = float(sma200.iloc[-1])
-
-    print(f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt {'über' if last_close>last_sma else 'unter'} 200DMA")
+    last_close, last_sma = float(close.iloc[-1]), float(sma200.iloc[-1])
+    logging.info(f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt "
+                 f"{'über' if last_close>last_sma else 'unter'} 200DMA")
     return last_close > last_sma
+
 
 # =====================
 # Signal- & Score-Berechnung
