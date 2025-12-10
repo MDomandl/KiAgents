@@ -89,6 +89,10 @@ class BTConfig:
     dump_decision_bundles: bool = False
     decisions_dir: str = "aktien_oop/decisions"
 
+    # NEU: Fenster-Konfiguration
+    score_days: int = 252
+    vol_days: int = 63
+
     verbose: bool = False
 
 # ---------------------------------------
@@ -512,11 +516,9 @@ class Backtester:
         if use_sl is None:
             use_sl = bool(mps and int(mps) > 0)
 
-        # Backtester hat typ. [windows]; zusätzlich auch Runner-Namen setzen
-        score_days = (getattr(getattr(cfg, "windows", object()), "score_days", None)
-                      or getattr(cfg, "days_win", None) or 252)
-        vol_days = (getattr(getattr(cfg, "windows", object()), "vol_days", None)
-                    or getattr(cfg, "vol_win", None) or 63)
+        # Fenster direkt aus BTConfig (kann über [windows] oder Root kommen)
+        score_days = int(getattr(cfg, "score_days", 252) or 252)
+        vol_days = int(getattr(cfg, "vol_days", 63) or 63)
         max_per_sector = _first(_get(cfg, "max_per_sector"),
                                 _get(limits, "max_per_sector"),
                                 None)
@@ -765,9 +767,10 @@ class Backtester:
                         f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
                         f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
                         f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
-                        f"score_days=252 vol_days=63 adjusted=True "
+                        f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
                         f"universe_len={len(_univ)} sha={_univ_sha}"
                     )
+
                     # --- /LOCKSTEP ---
 
                     print(f"[DBG][BT] write bundle as_of={_asof_ts:%Y-%m-%d} dir={_ddir} prefix={_prefix}")
@@ -812,9 +815,11 @@ class Backtester:
 
             # 1) Universe & Snapshots
             universe = list(valid_cols)  # valid_cols kommt direkt oberhalb aus deinem Preload
-            _old_weights_snapshot = cur_weights.to_dict() if isinstance(cur_weights, pd.Series) else {}
+            _old_weights_snapshot = {}  # stateless: keine alten Gewichte
+            prev_holdings = []  # für Lockstep-Test: immer leer
 
-            prev_holdings = [t for t, w in _old_weights_snapshot.items() if float(w) > 0.0 and t != "CASH"]
+           # _old_weights_snapshot = cur_weights.to_dict() if isinstance(cur_weights, pd.Series) else {}
+           # prev_holdings = [t for t, w in _old_weights_snapshot.items() if float(w) > 0.0 and t != "CASH"]
 
             # 2) Preis-/Sektor-Callbacks für Core
             # 2) Preis-/Sektor-Callbacks für Core
@@ -875,6 +880,11 @@ class Backtester:
                 _get_prices_bt,
                 _get_sectors_bt,
                 prev_holdings=prev_holdings,
+            )
+
+            self._dbg(
+                f"[BT/DBG] core_new_w_len={len(new_w_dict)} "
+                f"tickers={sorted(new_w_dict.keys())[:15]}"
             )
 
             # >>> DEBUG-DUMP NUR FÜR LOCKSTEP-TAG 2025-10-08
@@ -1096,7 +1106,7 @@ class Backtester:
                     f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
                     f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
                     f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
-                    f"score_days=252 vol_days=63 adjusted=True "
+                    f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
                     f"universe_len={len(_univ)} sha={_univ_sha}"
                 )
                 # --- /LOCKSTEP ---
@@ -1467,6 +1477,15 @@ def _first_not_none(*vals):
 def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
     d = _load_toml(a.config) if a.config else {}
 
+    # --- Fenster aus [windows] lesen, falls vorhanden ---
+    win = d.get("windows") or {}
+    if isinstance(win, dict):
+        win_score_days = win.get("score_days")
+        win_vol_days = win.get("vol_days")
+    else:
+        win_score_days = getattr(win, "score_days", None)
+        win_vol_days = getattr(win, "vol_days", None)
+
     # CLI-False (store_true default) nicht TOML überstimmen lassen:
     cli_dual = getattr(a, "dual_benchmark", None)
     if cli_dual is False:  # Flag nicht gesetzt → wie "None" behandeln
@@ -1556,6 +1575,14 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
             d.get("max_active_names", d.get("names_limit")),
             0
         ),
+
+        # NEU: Fenster-Werte aus [windows] oder Root
+        score_days=_coalesce(getattr(a, "score_days", None),
+                             d.get("score_days"),
+                             252),
+        vol_days=_coalesce(getattr(a, "vol_days", None),
+                           d.get("vol_days"),
+                           63),
 
         # Regime
         regime_use_filter=_coalesce(

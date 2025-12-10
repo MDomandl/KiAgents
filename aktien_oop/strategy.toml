@@ -20,3 +20,6 @@ vol_days   = 63
 [data]
 adjusted = true
 
+[limits]
+gap_filter = 0.12   # normal
+

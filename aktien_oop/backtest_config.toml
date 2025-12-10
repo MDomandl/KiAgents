@@ -6,6 +6,9 @@ use_sector_limits = true
 max_per_sector = 3
 adjusted = true
 
+score_days = 200
+vol_days   = 63
+
 as_of  = "2025-10-09"
 
 # --- Decision Bundles ---
@@ -34,7 +37,7 @@ frequency      = "monthly"   # "monthly" oder "weekly"
 use_sector_limits = true
 max_per_sector = 3           # 0 oder negativ = deaktiviert
 
-max_active_names    = 8     # oder 15, wenn du etwas „Luft“ willst
+max_active_names    = 0     # 8 .... oder 15, wenn du etwas „Luft“ willst
 
 # --- Kostenmodell (Basispunkte) ---
 cost_bps       = 0
@@ -48,20 +51,20 @@ verbose        = false
 
 # --- Gewichtung & Reibung ---
 use_equal_weight  = false   # statt inverse-Vol
-friction_eps      = 0.0015    # 1 Prozentpunkt Gewichtsdiff als Schwelle
+friction_eps      = 0.0    # 0.0015  .... 1 Prozentpunkt Gewichtsdiff als Schwelle
 friction_eps_pct = 0.00
-weight_round_step  = 0.01        # Zielgewichte auf 2 %-Punkt runden
-max_turnover_cap = 0.40   # pro Termin max. 50 % umschichten (weiches Cap)
-min_position_weight = 0.01   # 1 %-Punkt
+weight_round_step  = 0.0        # 0.01 ... Zielgewichte auf 2 %-Punkt runden
+max_turnover_cap = 1.0   # 0.40 ... pro Termin max. 50 % umschichten (weiches Cap)
+min_position_weight = 0.0   # 0.01 .... 1 %-Punkt
 
 # --- Regime & VolTarget ---
-regime_use_filter   = true
+regime_use_filter   = false  # true .....
 regime_sma_days     = 200
 regime_exposure_low = 0.65     # nur 60% Exposure, wenn Benchmark < SMA200
 
 
 # Volatility Targeting (optional)
-vol_target_ann      = 0.20
+vol_target_ann      = 0.00   #  0.20 ......
 vol_lookback_days   = 20
 
 # --- Benchmarks ---
@@ -73,9 +76,9 @@ benchmark2  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 rebalance_every_n  = 1         # nur jeden 2. Termin wirklich traden
 
 # --- Cash ---
-include_cash      = true      # explizites CASH-Gewicht als Residuum führen
+include_cash      = false      # true ..... explizites CASH-Gewicht als Residuum führen
 cash_yield_annual = 0.00      # 0.02 = 2% p.a.; 0.00 = zinsloses Cash
-max_weight_per_name = 0.30   # 25% pro Name
+max_weight_per_name = 1.0   # 0.30 .... 25% pro Name
 
 [core]
 period = "800d"

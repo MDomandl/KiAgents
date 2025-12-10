@@ -207,8 +207,42 @@ class Config:
         # limits
         if "use_sector_limits" in lim_cfg:
             d.setdefault("use_sector_limits", lim_cfg["use_sector_limits"])
+
         if "max_per_sector" in lim_cfg:
             d.setdefault("max_per_sector", lim_cfg["max_per_sector"])
+
+        if "gap_filter" in lim_cfg:
+            d.setdefault("gap_filter", lim_cfg["gap_filter"])
+
+        if "min_price" in lim_cfg:
+            d.setdefault("min_price", lim_cfg["min_price"])
+
+        if "min_volume" in lim_cfg:
+            d.setdefault("min_volume", lim_cfg["min_volume"])
+
+        if "friction_eps" in lim_cfg:
+            d.setdefault("friction_eps", lim_cfg["friction_eps"])
+
+        if "friction_eps_pct" in lim_cfg:
+            d.setdefault("friction_eps_pct", lim_cfg["friction_eps_pct"])
+
+        if "weight_round_step" in lim_cfg:
+            d.setdefault("weight_round_step", lim_cfg["weight_round_step"])
+
+        if "max_turnover_cap" in lim_cfg:
+            d.setdefault("max_turnover_cap", lim_cfg["max_turnover_cap"])
+
+        if "include_cash" in lim_cfg:
+            d.setdefault("include_cash", lim_cfg["include_cash"])
+
+        if "cost_bps" in lim_cfg:
+            d.setdefault("cost_bps", lim_cfg["cost_bps"])
+
+        if "slippage_bps" in lim_cfg:
+            d.setdefault("slippage_bps", lim_cfg["slippage_bps"])
+
+        if "max_lookback_days" in lim_cfg:
+            d.setdefault("max_lookback_days", lim_cfg["max_lookback_days"])
 
         # windows (kann der Runner später direkt aus win_cfg lesen)
         if "score_days" in win_cfg:

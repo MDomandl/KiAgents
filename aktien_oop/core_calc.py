@@ -260,25 +260,16 @@ def apply_filters(scores: pd.Series, prices: pd.DataFrame, p: CalcParams) -> pd.
     keep = scores.dropna().index
 
     # Close-Matrix (wie oben)
-    if "Close" in prices.columns and isinstance(prices.index, pd.MultiIndex):
-        close = prices["Close"].unstack("ticker").ffill()
-    elif "Close" in prices.columns:
-        close = prices["Close"].ffill()
-    elif "Adj Close" in prices.columns and isinstance(prices.index, pd.MultiIndex):
-        close = prices["Adj Close"].unstack("ticker").ffill()
-    else:
-        close = prices.get("Adj Close", None)
-        if close is None:
-            return keep
+    close = _to_close_matrix(prices)
+    close = close.loc[:pd.Timestamp(p.as_of).tz_localize(None)]
 
-    close.index = pd.to_datetime(close.index).tz_localize(None)
-    close = close.sort_index().loc[:pd.Timestamp(p.as_of).tz_localize(None)]
-
-    # 1d Return für Gap-Check (12% – BT-Logik)
+    # 1d Return für Gap-Check – Schwellwert aus p.gap_filter
     if len(close) >= 2:
-        ret1d = close.pct_change().iloc[-1]
-        gap_mask = ret1d.abs() > 0.12   # 12% Schwellwert wie im BT
-        keep = keep.difference(gap_mask[gap_mask].index)
+        thr = float(getattr(p, "gap_filter", 0.0) or 0.0)
+        if thr > 0:
+            ret1d = close.pct_change().iloc[-1]
+            gap_mask = ret1d.abs() > thr
+            keep = keep.difference(gap_mask[gap_mask].index)
 
     # optionale Preis/Volumen-Grenzen (falls du sie weiterhin nutzen willst)
     min_px = float(getattr(p, "min_price", 0.0) or 0.0)

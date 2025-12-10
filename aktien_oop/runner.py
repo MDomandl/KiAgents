@@ -13,7 +13,9 @@ from pathlib import Path
 from aktien_oop.core_calc import CalcParams, calculate_portfolio
 
 import logging
+import json
 from json import dumps
+from dataclasses import asdict
 from .config import Config, normalize_ticker, setup_logging
 from .data_client import DataClient
 from .engine import SignalEngine
@@ -284,6 +286,7 @@ class Runner:
         # Sektor-Limits
         use_sector_limits = bool(_sec_get(lim_cfg, "use_sector_limits", getattr(cfg, "use_sector_limits", True)))
         max_per_sector = _sec_get(lim_cfg, "max_per_sector", getattr(cfg, "max_per_sector", 3))
+        gap_filter = float(_sec_get(lim_cfg, "gap_filter", 0.12) or 0.12)
 
         # Rebalance-Frequenz
         rebalance_frequency = _sec_get(reb_cfg, "frequency", getattr(cfg, "rebalance_frequency", "monthly"))
@@ -295,60 +298,45 @@ class Runner:
             vol_days=vol_days,
             use_sector_limits=use_sector_limits,
             max_per_sector=max_per_sector,
-            rebalance_frequency=rebalance_frequency,
+            gap_filter=gap_filter,
+            rebalance=rebalance_frequency,
         )
 
     def _build_params(self, norm: dict) -> "CalcParams":
         """
         Baut CalcParams ausschließlich aus norm + cfg.
-        norm kommt aus _normalize_cfg() und enthält z.B.:
-          - as_of (Timestamp oder String)
-          - period
-          - score_days
-          - vol_days
-          - use_sector_limits
-          - max_per_sector
-          - rebalance_frequency
+        norm kommt aus _normalize_cfg und enthält bereits
+        period, as_of, score_days, vol_days, use_sector_limits, max_per_sector, rebalance, ...
         """
         cfg = self.cfg
 
-        # as_of aus norm sicher in "YYYY-MM-DD" umwandeln
-        as_of_val = norm["as_of"]
-        if isinstance(as_of_val, pd.Timestamp):
-            as_of_str = as_of_val.strftime("%Y-%m-%d")
-        else:
-            # falls schon String: einfach übernehmen
-            as_of_str = str(as_of_val)
-
-        # vol_days als int (CalcParams erwartet int, kein Optional)
-        vol_days_val = norm.get("vol_days", 0)
-        if vol_days_val is None:
-            vol_days_val = 0
-        vol_days_int = int(vol_days_val)
-
         return CalcParams(
             # Basis
-            as_of=as_of_str,
+            as_of=str(norm["as_of"]),
             period=norm["period"],
             adjusted=bool(getattr(cfg, "adjusted", True)),
 
             score_days=int(norm["score_days"]),
-            vol_days=vol_days_int,
+            vol_days=int(norm["vol_days"]),
 
-            # Filter bleiben auf Defaults in CalcParams, außer du willst sie explizit setzen
-            # use_under_sma / sma_days / gap_filter / min_price / min_volume
-            # -> nutzen die Dataclass-Defaults
+            # === Filter (müssen identisch zum Backtester sein!) ===
+            use_under_sma=bool(getattr(cfg, "use_under_sma", False)),
+            sma_days=int(getattr(cfg, "sma_days", 200)),
+            gap_filter=norm["gap_filter"],
+            min_price=float(getattr(cfg, "min_price", 0.0)),
+            min_volume=float(getattr(cfg, "min_volume", 0.0)),
 
-            # Limits & Auswahl
+            # === Limits & Auswahl ===
             use_sector_limits=bool(norm["use_sector_limits"]),
             max_per_sector=(
                 int(norm["max_per_sector"])
-                if norm["max_per_sector"] is not None else None
+                if norm["max_per_sector"] is not None
+                else None
             ),
-            top_k=int(norm.get("top_k", cfg.top_k)),
-            buffer_k=int(norm.get("buffer_k", cfg.buffer_k)),
+            top_k=int(cfg.top_k),
+            buffer_k=int(cfg.buffer_k),
 
-            # Finalisierung / Sizing
+            # === Finalisierung / Sizing ===
             include_cash=bool(getattr(cfg, "include_cash", False)),
             weight_round_step=float(getattr(cfg, "weight_round_step", 0.0)),
             max_turnover_cap=float(getattr(cfg, "max_turnover_cap", 1.0)),
@@ -356,12 +344,10 @@ class Runner:
             friction_eps_pct=float(getattr(cfg, "friction_eps_pct", 0.0)),
             cost_bps=float(getattr(cfg, "cost_bps", 0.0)),
             slippage_bps=float(getattr(cfg, "slippage_bps", 0.0)),
-            rebalance=norm["rebalance_frequency"],
-            max_lookback_days=(
-                int(getattr(cfg, "max_lookback_days"))
-                if getattr(cfg, "max_lookback_days", None) is not None
-                else None
-            ),
+
+            # === Meta ===
+            rebalance=norm["rebalance"],
+            max_lookback_days=getattr(cfg, "max_lookback_days", None),
         )
 
     # ---------------------------
@@ -402,7 +388,7 @@ class Runner:
         _assign_attr(cfg, "max_per_sector", (
             int(norm["max_per_sector"]) if norm["max_per_sector"] is not None else None
         ))
-        _assign_attr(cfg, "rebalance_frequency", norm["rebalance_frequency"])
+        _assign_attr(cfg, "rebalance_frequency", norm["rebalance"])
         _assign_attr(cfg, "period", norm["period"])
         if norm["as_of"] is not None:
             _assign_attr(cfg, "as_of", norm["as_of"])
@@ -575,10 +561,22 @@ class Runner:
         # --- 2) CalcParams aus norm bauen ---
         params = self._build_params(norm)
 
+        debug_dir = Path("aktien_oop/debug")
+        debug_dir.mkdir(exist_ok=True, parents=True)
+
+        cp_path = debug_dir / f"RUN_CalcParams_{as_of_str}.json"
+        with cp_path.open("w", encoding="utf-8") as f:
+            json.dump(asdict(params), f, indent=2, sort_keys=True, default=str)
+        logging.debug("RUN CalcParams dump: %s", cp_path)
+
         # === prev_holdings für Turnover-Buffer (aus letzter positions.csv) ===
-        prev_df = self.store.load_positions()
-        old_w = self._weights_from_positions(prev_df)
-        prev_holdings = list(old_w.keys())
+        prev_df = None
+        old_w = {}
+        prev_holdings = []
+
+        #prev_df = self.store.load_positions()
+        #old_w = self._weights_from_positions(prev_df)
+        #prev_holdings = list(old_w.keys())
 
         # --- DEBUG: Preismatrix prüfen ---
         probe = _get_prices(tickers, params.as_of, params.period, params.adjusted)
@@ -714,7 +712,7 @@ class Runner:
             # --- /LOCKSTEP ---
 
             # Bundle schreiben – nutzt den oben berechneten as_of_str
-            self._write_decision_bundle(as_of_str, old_w, new_w)
+            self._write_decision_bundle(norm["as_of"], old_w, new_w)
 
         self.store.append_csv(self.store.topk_log, sel)
         run_row = pd.DataFrame([{
