@@ -9,7 +9,7 @@ adjusted = true
 score_days = 200
 vol_days   = 63
 
-as_of  = "2025-10-09"
+as_of  = "2025-10-08"
 
 # --- Decision Bundles ---
 dump_decision_bundles = true
@@ -24,6 +24,10 @@ save_dir       = "aktien_oop"
 # --- Zeitraum & Frequenz ---
 start          = "2020-10-13"
 end            = "2025-10-09"
+
+
+dump_scores = true
+dump_tag = "BT"
 
 # --- Portfolio-Logik ---
 [topk]

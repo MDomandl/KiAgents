@@ -657,10 +657,12 @@ class Backtester:
         bt_end = asofN
 
         # 2.4) Preise EINMAL laden & normalisieren (breit: Spalten = Ticker)
-        prices_all = download_close(universe_all,
-                                    start=bt_start.date().isoformat(),
-                                    end=bt_end.date().isoformat(),
-                                    verbose=False)
+        prices_all = download_close(
+            universe_all,
+            start=bt_start.date().isoformat(),
+            end=(bt_end + pd.Timedelta(days=1)).date().isoformat(),  # <- +1 Tag
+            verbose=False
+        )
         prices_all = _normalize_price_columns(prices_all)
         prices_all.index = pd.to_datetime(prices_all.index).tz_localize(None)
         prices_all = prices_all[~prices_all.index.duplicated()].sort_index().ffill()
@@ -822,7 +824,6 @@ class Backtester:
            # prev_holdings = [t for t, w in _old_weights_snapshot.items() if float(w) > 0.0 and t != "CASH"]
 
             # 2) Preis-/Sektor-Callbacks für Core
-            # 2) Preis-/Sektor-Callbacks für Core
             def _get_prices_bt(tickers, as_of, period, adjusted=True):
                 """
                 Vom Core aufgerufen als get_prices(universe, p.as_of, p.period, p.adjusted)
@@ -840,13 +841,16 @@ class Backtester:
                 frame = prices_all.loc[_start:_end, list(tickers)].copy()
                 return frame
 
+            def _to_ts(x):
+                return pd.Timestamp(x).normalize() if x is not None else None
+
             def _get_sectors_bt(tickers):
                 return {t: secmap.get(t, "UNKNOWN") for t in tickers}
 
             # 3) CalcParams aus cfg
             _asof_str = d.strftime("%Y-%m-%d")
             cp = CalcParams(
-                as_of=d.strftime("%Y-%m-%d"),
+                as_of=_asof_str,
                 period=getattr(self.cfg, "period", "800d"),
                 adjusted=bool(adjusted),
                 score_days=int(score_days),
@@ -871,6 +875,9 @@ class Backtester:
                 max_turnover_cap=float(getattr(self.cfg, "max_turnover_cap", 1.0)),
                 friction_eps=float(getattr(self.cfg, "friction_eps", 0.0)),
                 friction_eps_pct=float(getattr(self.cfg, "friction_eps_pct", 0.0)),
+
+                dump_scores=True,
+                dump_tag="BT",
             )
 
             # 4) Core-Call (Selektion/Ranks/Scores)

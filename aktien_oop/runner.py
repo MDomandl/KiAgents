@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import hashlib
 from pathlib import Path
-from aktien_oop.core_calc import CalcParams, calculate_portfolio
+from aktien_oop.core_calc import CalcParams, calculate_portfolio, slice_to_window
 
 import logging
 import json
@@ -286,7 +286,8 @@ class Runner:
         # Sektor-Limits
         use_sector_limits = bool(_sec_get(lim_cfg, "use_sector_limits", getattr(cfg, "use_sector_limits", True)))
         max_per_sector = _sec_get(lim_cfg, "max_per_sector", getattr(cfg, "max_per_sector", 3))
-        gap_filter = float(_sec_get(lim_cfg, "gap_filter", 0.12) or 0.12)
+        raw_gap = _sec_get(lim_cfg, "gap_filter", None)
+        gap_filter = float(0.12 if raw_gap is None else raw_gap)
 
         # Rebalance-Frequenz
         rebalance_frequency = _sec_get(reb_cfg, "frequency", getattr(cfg, "rebalance_frequency", "monthly"))
@@ -348,6 +349,9 @@ class Runner:
             # === Meta ===
             rebalance=norm["rebalance"],
             max_lookback_days=getattr(cfg, "max_lookback_days", None),
+
+            dump_scores=True,
+            dump_tag="RUN",
         )
 
     # ---------------------------
@@ -537,8 +541,8 @@ class Runner:
 
         # === Core-Calc Callbacks ===
         def _get_prices(universe, as_of, period, adjusted):
-            # Nimm den DataClient – gleiche Datenquelle wie im BT
-            return self.data.load_prices(universe, as_of, period, adjusted)
+            px = self.data.load_prices(universe, as_of, period, adjusted)
+            return slice_to_window(px, as_of, period)
 
         def _get_sectors(universe):
             # identische Meta wie oben geladen (sector_map)

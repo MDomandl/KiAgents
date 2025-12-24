@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, Dict, Optional, Tuple, Callable, Iterable
 import pandas as pd
+from pathlib import Path
 
 # ======= Kern-Parameter (wirken auf Ergebnis) =======
 @dataclass(frozen=True)
@@ -37,6 +38,9 @@ class CalcParams:
     rebalance: str = "monthly"
     max_lookback_days: int  = None
 
+    dump_scores: bool = False
+    dump_tag: str = ""
+
 # Signaturen für die Injektionsfunktionen
 GetPricesFn  = Callable[[Sequence[str], str, str, bool], pd.DataFrame]
 GetSectorsFn = Callable[[Sequence[str]], Dict[str, str]]
@@ -44,6 +48,71 @@ GetSectorsFn = Callable[[Sequence[str]], Dict[str, str]]
 def _rank_desc(scores: pd.Series) -> pd.Series:
     """Ränge 1..N (1 = bester Score) – stabil wie im BT."""
     return scores.rank(ascending=False, method="first").astype(int)
+
+def _period_to_days(period: str | None) -> int:
+    if period is None:
+        return 800
+    s = str(period).strip().lower()
+    try:
+        if s.endswith("d"):
+            return int(s[:-1])
+        if s.endswith("m"):
+            return int(s[:-1]) * 30
+        if s.endswith("y"):
+            return int(s[:-1]) * 365
+        return int(s)
+    except Exception:
+        return 800
+
+
+def slice_to_window(prices: pd.DataFrame, as_of: str, period: str) -> pd.DataFrame:
+    """
+    Einheitliches, deterministisches Slicing/Clamping:
+    - tz-naiv
+    - sortiert, dedupliziert
+    - start = backfill auf nächsten verfügbaren Handelstag
+    - end   = pad auf letzten verfügbaren Handelstag <= as_of
+    """
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+
+    df = prices.copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df[~df.index.duplicated()].sort_index()
+
+    idx = df.index
+    asof = pd.Timestamp(as_of).tz_localize(None)
+    days = _period_to_days(period)
+    start_target = asof - pd.Timedelta(days=days)
+
+    # Clamp start/end auf vorhandene Indizes
+    start_pos = idx.get_indexer([start_target], method="backfill")[0]
+    end_pos   = idx.get_indexer([asof], method="pad")[0]
+
+    if start_pos < 0:
+        start_pos = 0
+    if end_pos < 0:
+        end_pos = len(idx) - 1
+
+    start = idx[start_pos]
+    end   = idx[end_pos]
+
+    return df.loc[start:end].copy()
+
+def _norm_sector(sec) -> str | None:
+    """
+    Normalisiert Sektor-Strings, damit BT/RUN identische Keys verwenden.
+    None => "unbekannt" => NICHT sektor-limitiert.
+    """
+    if sec is None:
+        return None
+    s = str(sec).strip()
+    if not s:
+        return None
+    u = s.upper()
+    if u in ("UNKNOWN", "N/A", "NA", "NONE", "NULL"):
+        return None
+    return u
 
 def _sector_ok(picked_count_by_sec: Dict[str,int], sec: str, p: CalcParams) -> bool:
     if not p.use_sector_limits or not p.max_per_sector:
@@ -85,10 +154,20 @@ def select_topk_buffer(
         if t not in s.index:
             continue
         if int(ranks[t]) <= cutoff:
-            sec = sectors.get(t, "UNKNOWN")
-            if _sector_ok(per_sec, sec, p):
+            sec = _norm_sector(sectors.get(t))  # None, wenn unbekannt
+
+            # Alles was "unbekannt" ist, soll NICHT sektor-limitiert werden
+            if sec is None or str(sec).strip().upper() in ("", "UNKNOWN", "N/A", "NA", "NONE"):
                 picked.append(t)
-                per_sec[sec] = per_sec.get(sec, 0) + 1
+                if len(picked) >= top_k:
+                    return picked if len(picked) >= top_k else picked
+            else:
+                if _sector_ok(per_sec, sec, p):
+                    picked.append(t)
+                    per_sec[sec] = per_sec.get(sec, 0) + 1
+                    if len(picked) >= top_k:
+                        return picked
+
                 if len(picked) >= top_k:
                     return picked  # fertig
 
@@ -96,10 +175,20 @@ def select_topk_buffer(
     for t in s.index:
         if t in picked:
             continue
-        sec = sectors.get(t, "UNKNOWN")
-        if _sector_ok(per_sec, sec, p):
+        sec = _norm_sector(sectors.get(t))  # None, wenn unbekannt
+
+        # Alles was "unbekannt" ist, soll NICHT sektor-limitiert werden
+        if sec is None or str(sec).strip().upper() in ("", "UNKNOWN", "N/A", "NA", "NONE"):
             picked.append(t)
-            per_sec[sec] = per_sec.get(sec, 0) + 1
+            if len(picked) >= top_k:
+                return picked if len(picked) >= top_k else picked
+        else:
+            if _sector_ok(per_sec, sec, p):
+                picked.append(t)
+                per_sec[sec] = per_sec.get(sec, 0) + 1
+                if len(picked) >= top_k:
+                    return picked
+
             if len(picked) >= top_k:
                 break
 
@@ -264,12 +353,11 @@ def apply_filters(scores: pd.Series, prices: pd.DataFrame, p: CalcParams) -> pd.
     close = close.loc[:pd.Timestamp(p.as_of).tz_localize(None)]
 
     # 1d Return für Gap-Check – Schwellwert aus p.gap_filter
-    if len(close) >= 2:
-        thr = float(getattr(p, "gap_filter", 0.0) or 0.0)
-        if thr > 0:
-            ret1d = close.pct_change().iloc[-1]
-            gap_mask = ret1d.abs() > thr
-            keep = keep.difference(gap_mask[gap_mask].index)
+    gap_thr = float(getattr(p, "gap_filter", 0.0) or 0.0)
+    if len(close) >= 2 and gap_thr > 0.0:
+        ret1d = close.pct_change().iloc[-1]
+        gap_mask = ret1d.abs() > gap_thr
+        keep = keep.difference(gap_mask[gap_mask].index)
 
     # optionale Preis/Volumen-Grenzen (falls du sie weiterhin nutzen willst)
     min_px = float(getattr(p, "min_price", 0.0) or 0.0)
@@ -302,7 +390,7 @@ def select_topk(scores: pd.Series, keep: pd.Index,
 
     picked, per_sec = [], {}
     for t in s.index:
-        sec = sectors.get(t, "UNKNOWN")
+        sec = _norm_sector(sectors.get(t))
         if per_sec.get(sec, 0) >= int(p.max_per_sector):
             continue
         picked.append(t)
@@ -340,6 +428,20 @@ def _safe_reindex_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     # gewünschte Reihenfolge wiederherstellen
     return out.reindex(columns=cols)
 
+def dump_scores(scores, as_of_str, tag):
+    Path("aktien_oop/decisions").mkdir(parents=True, exist_ok=True)
+
+    df = (
+        scores
+        .dropna()
+        .sort_values(ascending=False)
+        .to_frame(name=as_of_str)
+    )
+    df.index.name = "ticker"
+
+    path = f"aktien_oop/decisions/scores_{tag}_{as_of_str}.csv"
+    df.to_csv(path)
+
 
 def calculate_portfolio(
     universe: Sequence[str],
@@ -353,9 +455,72 @@ def calculate_portfolio(
     Liefert: (weights_dict, scores_series)
     """
     prices  = get_prices(universe, p.as_of, p.period, p.adjusted)
+    close = prices
+    try:
+        close = close.loc[:pd.Timestamp(p.as_of).tz_localize(None)]
+    except Exception:
+        pass
+    # --- DEBUG: Price window check (Runner) ---
+    if getattr(p, "dump_scores", False):
+        print("=== PRICE WINDOW DEBUG (Runner) ===")
+        print("p.as_of:", p.as_of)
+        print("p.period:", p.period)
+        print("TAG:", getattr(p, "dump_tag", "?"), "AS_OF:", p.as_of, "PERIOD:", p.period)
+        print("ROWS:", len(close.index), "MIN:", close.index.min(), "MAX:", close.index.max())
+        print("prices.index.min():", prices.index.min() if not prices.empty else None)
+        print("prices.index.max():", prices.index.max() if not prices.empty else None)
+        print("len(prices.index):", len(prices.index))
+        print("LAST ROW DATE:", prices.index.max(), "AS_OF:", p.as_of)
+        if not prices.empty:
+            print("prices.index[-5:]:", list(prices.index[-5:]))
+        print("===================================")
+
+    prices = slice_to_window(prices, p.as_of, p.period)
+    prices = slice_to_window(prices, p.as_of, p.period)
+
+    if getattr(p, "dump_scores", False):
+        print("=== PRICE WINDOW AFTER SLICE ===")
+        print("prices.index.min():", prices.index.min())
+        print("prices.index.max():", prices.index.max())
+        print("len(prices.index):", len(prices.index))
+        print("LAST ROW DATE:", prices.index.max(), "AS_OF:", p.as_of)
+        print("================================")
+
+    if prices is not None and not prices.empty:
+        eff_asof = pd.Timestamp(prices.index.max()).tz_localize(None)
+    else:
+        eff_asof = pd.Timestamp(p.as_of).tz_localize(None)
+
+    req_asof = pd.Timestamp(p.as_of).normalize()
+    px = prices.loc[:req_asof]
+    if len(px) == 0:
+        raise ValueError(f"No price data on/before as_of={req_asof}")
+
+    asof_eff = px.index.max()  # letzter verfügbarer Handelstag <= req_asof
+    prices_eff = prices.loc[:asof_eff]  # konsistente Basis
+
     sectors = get_sectors(universe)
-    scores  = compute_scores(prices, p)
-    keep    = apply_filters(scores, prices, p)
+    if getattr(p, "dump_scores", False):
+        watch = {"APH", "AVGO", "LRCX", "MPWR", "ORCL", "PLTR", "DASH", "EBAY", "GE", "HII", "IVZ", "TPR"}
+        for t in sorted(watch):
+            if t in universe:
+                print(f"[SECTOR DBG] {getattr(p, 'dump_tag', 'X')} {t}: {sectors.get(t)!r}")
+
+    scores  = compute_scores(prices_eff, p)
+    if getattr(p, "dump_scores", False):
+        dump_dir = Path("aktien_oop/dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        as_of = str(p.as_of)[:10]
+        tag = getattr(p, "dump_tag", "X")
+
+        out = dump_dir / f"scores_{tag}_{as_of}.csv"
+
+        s = scores.dropna().sort_values(ascending=False)
+        df = pd.DataFrame({"ticker": s.index, "score": s.values})
+        df.to_csv(out, index=False)
+
+    keep    = apply_filters(scores, prices_eff, p)
 
     if prev_holdings is not None:
         names = select_topk_buffer(scores, keep, sectors, p, prev_holdings=prev_holdings)

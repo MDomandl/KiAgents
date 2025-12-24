@@ -15,6 +15,9 @@ save_dir = "aktien_oop"
 tickers_file = "aktien_oop/sp500_tickers.txt"
 sector_meta = "aktien_oop/sp500_meta.csv"
 
+dump_scores = true
+dump_tag = "RUN"
+
 [core]
 period = "800d"
 as_of = "2025-10-08"
@@ -33,7 +36,7 @@ frequency  = "monthly"
 [limits]
 use_sector_limits = true
 max_per_sector = 3
-gap_filter = 0.12   # normal
+gap_filter = 0.0   # 0.12 ..... normal
 
 # Filter so wie im BT/Helper gedacht
 days_win = 130

@@ -3,7 +3,7 @@ buffer_k = 3
 rebalance = "monthly"
 max_per_sector = 3
 period = "800d"
-as_of = "2025-10-10"     # nur setzen, wenn du einen fixen Stichtag willst
+as_of = "2025-10-08"     # nur setzen, wenn du einen fixen Stichtag willst
 max_lookback_days = 720
 tickers_file = "aktien_oop/sp500_tickers.txt"
 sector_meta_file = "aktien_oop/sp500_meta.csv"
@@ -21,5 +21,5 @@ vol_days   = 63
 adjusted = true
 
 [limits]
-gap_filter = 0.12   # normal
+gap_filter = 0.0   # 0.12 .... normal
 
