@@ -410,19 +410,22 @@ class Runner:
             norm["max_per_sector"],
         )
 
-
         now = pd.Timestamp.now()
         last_dt = self.store.last_rebalance_time()
         logging.info("Force=%s, last_rebalance=%s", self.cfg.force_rebalance, last_dt)
 
-        if (not self.cfg.force_rebalance) and last_dt is not None:
-            if self._same_period(last_dt, now, self.cfg.rebalance_frequency):
-                self._print_existing_positions()
-                logging.info(
-                    "Bereits rebalanced in dieser %s – (--force/--force-rebalance) für sofort",
-                    "Woche" if self.cfg.rebalance_frequency == "weekly" else "Monat"
-                )
-                return
+        # EINHEITLICH: nur diese Funktion entscheidet über Cadence/Force
+        if not self._should_rebalance(last_dt):
+            self._print_existing_positions()
+            logging.info(
+                "Bereits rebalanced in dieser %s – (--force/--force-rebalance) für sofort",
+                "Woche" if self.cfg.rebalance_frequency == "weekly" else "Monat"
+            )
+            return
+
+        else:
+            if self.cfg.force_rebalance:
+                logging.info("Force-Rebalance aktiv – ignoriere Cadence.")
 
         tickers = self.load_tickers()
         sector_map = self._load_sector_map()
@@ -578,9 +581,16 @@ class Runner:
         old_w = {}
         prev_holdings = []
 
-        #prev_df = self.store.load_positions()
-        #old_w = self._weights_from_positions(prev_df)
-        #prev_holdings = list(old_w.keys())
+        # === prev_holdings für Turnover-Buffer (aus Snapshot VOR as_of) ===
+        prev_df = self.store.load_positions_before(as_of_str)  # <— wichtig: BEFORE!
+        old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
+        prev_holdings = list(old_w.keys())
+
+        logging.debug("prev_df rows=%s cols=%s",
+                      0 if prev_df is None else len(prev_df),
+                      [] if prev_df is None else list(prev_df.columns))
+        logging.debug("old_w n=%d sample=%s", len(old_w), list(old_w.items())[:5])
+        logging.debug("prev_holdings n=%d tickers=%s", len(prev_holdings), prev_holdings)
 
         # --- DEBUG: Preismatrix prüfen ---
         probe = _get_prices(tickers, params.as_of, params.period, params.adjusted)
@@ -687,8 +697,8 @@ class Runner:
         # --- Decision-Bundle (Runner) ---
         if getattr(self.cfg, "dump_decision_bundles", False):
             # alte Gewichte (aus letzter positions.csv)
-            prev_df = self.store.load_positions()
-            old_w = self._weights_from_positions(prev_df)
+            prev_df = self.store.load_positions_before(as_of_str)
+            old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
 
             # neue Gewichte (aus aktueller Auswahl)
             new_w = self._weights_from_positions(sel)

@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 from aktien_oop.core_calc import CalcParams, calculate_portfolio
+from .config import normalize_ticker
 
 import numpy as np
 import pandas as pd
@@ -159,13 +160,57 @@ def load_tickers(path: str) -> List[str]:
                 syms.append(s)
     return sorted(set(syms))
 
-
 def load_sector_map(path: Optional[str]) -> Dict[str, str]:
+    """
+    Robustes Laden von Ticker→Sector aus CSV.
+    Erwartet idealerweise Spalten: ticker, sector
+    akzeptiert aber auch gängige Alternativen (Symbol, GICS Sector, etc.)
+    und normalisiert Ticker (z.B. BRK.B -> BRK-B).
+    """
     if not path:
         return {}
-    df = pd.read_csv(path)
-    df = df.dropna(subset=["ticker", "sector"])
-    return dict(zip(df["ticker"], df["sector"]))
+
+    p = Path(path)
+    if not p.is_absolute():
+        # relativ zur Projekt-Root / Working-Dir
+        p = Path.cwd() / p
+
+    if not p.exists():
+        return {}
+
+    df = pd.read_csv(p)
+
+    # Spalten erkennen
+    cols = {c.lower(): c for c in df.columns}
+
+    def _pick(*names: str) -> Optional[str]:
+        for n in names:
+            if n.lower() in cols:
+                return cols[n.lower()]
+        return None
+
+    c_ticker = _pick("ticker", "symbol", "sym")
+    c_sector = _pick("sector", "gics sector", "gics_sector", "gics")
+
+    if not c_ticker or not c_sector:
+        return {}
+
+    def _norm_ticker(x: str) -> str:
+        s = str(x).strip().upper()
+        # Yahoo/Runner-Normalisierung: Punkt wird oft zu Bindestrich
+        s = s.replace(".", "-")
+        return s
+
+    tmp = df[[c_ticker, c_sector]].copy()
+    tmp.columns = ["ticker", "sector"]
+    tmp["ticker"] = tmp["ticker"].map(_norm_ticker)
+    tmp["sector"] = tmp["sector"].astype(str).str.strip()
+
+    tmp = tmp.dropna(subset=["ticker", "sector"])
+    tmp = tmp.drop_duplicates(subset=["ticker"])
+
+    return dict(zip(tmp["ticker"], tmp["sector"]))
+
 
 def _cfg_get(cfg, dotted: str, default=None):
     cur = cfg
@@ -563,8 +608,6 @@ class Backtester:
         if self.cfg.weight_round_step:
             assert 0.0 <= self.cfg.weight_round_step <= 0.05, "round step looks large; did you mean e.g. 0.01?"
 
-        secmap = load_sector_map(self.cfg.sector_meta)
-
         # 1) Daten laden
         px = download_close(tickers, self.cfg.start, self.cfg.end, verbose=self.cfg.verbose)
         # Index säubern und sortieren
@@ -637,17 +680,28 @@ class Backtester:
             # Fallback: S&P500 laden – falls du das in deinem Projekt nutzt
             universe_all = load_sp500_tickers()
 
-        # 2.2) Sector-Map (Ticker -> Sektor)
-        try:
-            meta = getattr(self, "meta", None)
-            if isinstance(meta, dict) and meta:
-                secmap_pre = {t: meta.get(t, "UNKNOWN") for t in universe_all}
-            else:
-                meta_df = load_sp500_meta()
-                secmap_pre = {t: meta_df.get(t, {}).get("sector", "UNKNOWN") if isinstance(meta_df, dict) else "UNKNOWN"
-                              for t in universe_all}
-        except Exception:
-            secmap_pre = {t: "UNKNOWN" for t in universe_all}
+        # 2.2) Sector-Map (Ticker -> Sektor) – MUSS lockstep zum Runner sein
+        secmap_loaded = load_sector_map(self.cfg.sector_meta)  # z.B. aktien_oop/sp500_meta.csv
+
+        # fallback nur wenn wirklich nichts geladen werden konnte
+        if not secmap_loaded:
+            try:
+                meta_df = load_sp500_meta()  # falls das bei dir intern funktioniert
+                if isinstance(meta_df, dict):
+                    # meta_df: { "AAPL": {"sector": "..."} , ... }
+                    secmap_loaded = {
+                        str(t).strip().upper().replace(".", "-"): str(meta_df.get(t, {}).get("sector", "UNKNOWN"))
+                        for t in universe_all
+                    }
+            except Exception:
+                secmap_loaded = {}
+
+        # Universe-spezifische Map (und UNKNOWN wenn nicht vorhanden)
+        secmap_pre = {
+            str(t).strip().upper().replace(".", "-"): secmap_loaded.get(str(t).strip().upper().replace(".", "-"),
+                                                                        "UNKNOWN")
+            for t in universe_all
+        }
 
         # 2.3) Preload-Fenster bestimmen
         asof0 = pd.Timestamp(rdates[0])
@@ -817,10 +871,18 @@ class Backtester:
 
             # 1) Universe & Snapshots
             universe = list(valid_cols)  # valid_cols kommt direkt oberhalb aus deinem Preload
-            _old_weights_snapshot = {}  # stateless: keine alten Gewichte
-            prev_holdings = []  # für Lockstep-Test: immer leer
+            # 1) Universe & Snapshots (STATEFUL für echten Backtest)
+            _old_weights_snapshot = (
+                cur_weights.to_dict()
+                if isinstance(cur_weights, pd.Series) and not cur_weights.empty
+                else {}
+            )
+            prev_holdings = [
+                t for t, w in _old_weights_snapshot.items()
+                if float(w) > 0.0 and t != "CASH"
+            ]
 
-           # _old_weights_snapshot = cur_weights.to_dict() if isinstance(cur_weights, pd.Series) else {}
+            # _old_weights_snapshot = cur_weights.to_dict() if isinstance(cur_weights, pd.Series) else {}
            # prev_holdings = [t for t, w in _old_weights_snapshot.items() if float(w) > 0.0 and t != "CASH"]
 
             # 2) Preis-/Sektor-Callbacks für Core

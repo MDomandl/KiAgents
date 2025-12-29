@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import csv
+import logging
 import pandas as pd
 
 class PortfolioStore:
@@ -13,7 +14,31 @@ class PortfolioStore:
         self.rankings_log   = self.save_dir / "rankings_log.csv"
         self.runs_log       = self.save_dir / "runs_log.csv"
         self.topk_log       = self.save_dir / "topk_log.csv"
-        self.runs_meta_jsonl = self.save_dir / "runs_meta.jsonl"   # ⬅️ neu
+        self.runs_meta_jsonl = self.save_dir / "runs_meta.jsonl"
+
+    def load_positions_before(self, as_of: str | pd.Timestamp) -> pd.DataFrame | None:
+        p = self.positions_path
+        if not p.exists():
+            return None
+
+        df = pd.read_csv(p)
+        if df.empty:
+            return None
+
+        if "as_of" not in df.columns:
+            logging.warning("positions.csv hat keine 'as_of'-Spalte – kann nicht 'before(as_of)' selektieren.")
+            return None
+
+        df["as_of"] = pd.to_datetime(df["as_of"]).dt.normalize()
+        cur = pd.Timestamp(as_of).normalize()
+
+        df_prev = df[df["as_of"] < cur]
+        if df_prev.empty:
+            return None
+
+        prev_asof = df_prev["as_of"].max()
+        snap = df_prev[df_prev["as_of"] == prev_asof].copy()
+        return snap
 
     def load_positions(self) -> pd.DataFrame:
         if not self.positions_path.exists():

@@ -11,7 +11,7 @@ sector_meta_file = "aktien_oop/sp500_meta.csv"
 [filters]
 gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
 sma_window   = 200
-require_above_sma = true
+require_above_sma = false #..... true
 
 [windows]
 score_days = 200

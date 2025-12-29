@@ -152,7 +152,7 @@ def main():
         if not pairs:
             print("Keine passenden BT/RUN-Paare gefunden."); sys.exit(1)
         ok_all=True
-        for bp, rp, bd, rd in pairs[:3]:
+        for bp, rp, bd, rd in pairs[:12]:
             print(f"\n(Pair) nearest: BT={bd.date()}  RUN={rd.date()}  Δ={(rd-bd).days} Tage")
             ok = _cmp(bp, rp, tol_bps=args.bps, ignore_cash=args.ignore_cash, args=args)
             ok_all = ok_all and ok

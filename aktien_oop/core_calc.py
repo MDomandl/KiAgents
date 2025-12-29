@@ -136,8 +136,18 @@ def select_topk_buffer(
     if prev_holdings is None:
         prev_holdings = []
 
-    # Kandidaten & Ränge
-    s = scores.loc[keep].dropna().sort_values(ascending=False)
+    # Kandidaten: scores nur für keep, ohne NaNs
+    s0 = scores.reindex(keep).dropna()
+
+    # Deterministische Sortierung: score desc, ticker asc
+    cand = (
+        pd.DataFrame({"ticker": s0.index.astype(str), "score": s0.values})
+        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
+    )
+
+    # wieder Series wie zuvor
+    s = pd.Series(cand["score"].to_numpy(), index=cand["ticker"].to_numpy(), dtype=float)
+
     if s.empty:
         return []
     ranks = _rank_desc(s)  # 1..N (1 = top)
@@ -384,7 +394,18 @@ def apply_filters(scores: pd.Series, prices: pd.DataFrame, p: CalcParams) -> pd.
 
 def select_topk(scores: pd.Series, keep: pd.Index,
                 sectors: Dict[str, str], p: CalcParams) -> Sequence[str]:
-    s = scores.loc[keep].sort_values(ascending=False)
+    # Kandidaten: scores nur für keep, ohne NaNs
+    s0 = scores.reindex(keep).dropna()
+
+    # Deterministische Sortierung: score desc, ticker asc
+    cand = (
+        pd.DataFrame({"ticker": s0.index.astype(str), "score": s0.values})
+        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
+    )
+
+    # wieder Series wie zuvor
+    s = pd.Series(cand["score"].to_numpy(), index=cand["ticker"].to_numpy(), dtype=float)
+
     if not p.use_sector_limits or not p.max_per_sector:
         return list(s.index[:p.top_k])
 
@@ -526,6 +547,37 @@ def calculate_portfolio(
         names = select_topk_buffer(scores, keep, sectors, p, prev_holdings=prev_holdings)
     else:
         names = select_topk(scores, keep, sectors, p)
+    if getattr(p, "dump_scores", False):
+        dump_dir = Path("aktien_oop/dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        as_of = str(p.as_of)[:10]
+        tag = getattr(p, "dump_tag", "X")
+
+        # 1) Score-Dump (wie bisher)
+        out_scores = dump_dir / f"scores_{tag}_{as_of}.csv"
+        s = scores.dropna().sort_values(ascending=False)
+        pd.DataFrame({"ticker": s.index, "score": s.values}).to_csv(out_scores, index=False)
+
+        # 2) Selection-Dump (NEU)
+        selected_set = set(names)
+        keep_set = set(keep)
+
+        df_sel = pd.DataFrame({
+            "ticker": scores.index.astype(str),
+            "score": scores.values,
+        })
+        df_sel["keep"] = df_sel["ticker"].isin(keep_set)
+        df_sel["sector"] = df_sel["ticker"].map(lambda t: sectors.get(t, "UNKNOWN"))
+        df_sel["selected"] = df_sel["ticker"].isin(selected_set)
+
+        # rank nur für sinnvolle Zeilen
+        df_sel = df_sel[df_sel["keep"]].copy()
+        df_sel = df_sel.sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
+        df_sel["rank"] = range(1, len(df_sel) + 1)
+
+        out_sel = dump_dir / f"selection_{tag}_{as_of}.csv"
+        df_sel.to_csv(out_sel, index=False)
 
     # einfache Equal-Weights (falls du Caps/Rundung willst: in size_weights spiegeln)
     weights = size_weights(names, p)
