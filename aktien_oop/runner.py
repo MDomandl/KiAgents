@@ -445,102 +445,29 @@ class Runner:
         )
 
         # Markt-Regime-Filter (S&P 500 > 200DMA?)
-        if not self.data.sp500_above_200dma():
-            logging.warning("Abbruch: S&P 500 unter 200DMA (kein Long-Markt).")
-            # optional: minimalistischer Lauf-Eintrag
-            run_row = pd.DataFrame([{
-                "as_of": as_of_str,
-                "adjusted": self.cfg.adjusted, "period": self.cfg.period, "days_win": self.cfg.days_win,
-                "gap_th": self.cfg.gap_th, "adv_min": self.cfg.adv_min_dollars,
-                "top_k": self.cfg.top_k, "buffer_k": self.cfg.buffer_k,
-                "num_universe": len(tickers), "num_pass": 0,
-                "fail_counts": dict(self.engine.fail_counts),
-                "sector_limits_active": limits_active,
-            }])
+        # --- Regime (zentral, as-of-korrekt) ---
+        decision = self.data.regime_decision(self.cfg, as_of_str)
 
-            self.store.append_csv(self.store.runs_log, run_row)
-            # JSONL-Meta (falls verfügbar)
-            meta = {
-                "as_of": as_of_str,
-                "universe_size": len(tickers),
-                "num_pass": 0,
-                "adjusted": self.cfg.adjusted,
-                "period": self.cfg.period,
-                "days_win": self.cfg.days_win,
-                "gap_th": self.cfg.gap_th,
-                "adv_min_dollars": self.cfg.adv_min_dollars,
-                "top_k": self.cfg.top_k,
-                "buffer_k": self.cfg.buffer_k,
-                "sector_limits_active": limits_active,
-                "max_per_sector": self.cfg.max_per_sector,
-                "sector_limits": self.cfg.sector_limits,
-                "sector_meta_file": str(self.cfg.sector_meta_file),
-                "selected_sector_counts": {},
-                "fail_counts": dict(self.engine.fail_counts),
-                "aborted_reason": "sp500_below_200dma",
-            }
-            try:
-                # nur wenn in store.py vorhanden
-                self.store.append_jsonl(self.store.runs_meta_jsonl, meta)  # type: ignore[attr-defined]
-            except Exception:
+        if not decision["ok"]:
+            logging.warning("Regime: %s | action=%s", decision["reason"], decision["action"])
+
+            # Logging/Meta schreiben wie bisher (runs_log / runs_meta_jsonl),
+            # aber als "aborted_reason" nimm decision["reason"].
+
+            if decision["action"] == "SELL":
+                # -> hier NICHT 'return' ohne Decision Bundle,
+                # sondern: new_weights = {} (oder nur CASH, wenn include_cash)
+                # und Turnover gegen old_w berechnen (wie normal).
                 pass
-            return
 
-        # Signale berechnen
-        # ===== Gemeinsame Kernberechnung (Core-Calc) =====
-
-        # Universe & Sektoren liegen bereits vor:
-        tickers = self.load_tickers()
-        sector_map = self._load_sector_map()
-        has_sector_meta = bool(sector_map)
-        limits_active = has_sector_meta and (
-                (self.cfg.max_per_sector is not None and self.cfg.max_per_sector > 0)
-                or bool(self.cfg.sector_limits)
-        )
-        print(
-            f"Sektor-Limits: {'AKTIV' if limits_active else 'inaktiv'} | "
-            f"max_per_sector={self.cfg.max_per_sector} | "
-            f"sector_limits={self.cfg.sector_limits or '-'} | "
-            f"meta={self.cfg.sector_meta_file}"
-        )
-
-        # Regime-Check beibehalten (wie vorher)
-        if not self.data.sp500_above_200dma():
-            logging.warning("Abbruch: S&P 500 unter 200DMA (kein Long-Markt).")
-            run_row = pd.DataFrame([{
-                "as_of": as_of_str,
-                "adjusted": self.cfg.adjusted, "period": self.cfg.period, "days_win": self.cfg.days_win,
-                "gap_th": self.cfg.gap_th, "adv_min": self.cfg.adv_min_dollars,
-                "top_k": self.cfg.top_k, "buffer_k": self.cfg.buffer_k,
-                "num_universe": len(tickers), "num_pass": 0,
-                "fail_counts": dict(self.engine.fail_counts),
-                "sector_limits_active": limits_active,
-            }])
-            self.store.append_csv(self.store.runs_log, run_row)
-            meta = {
-                "as_of": as_of_str,
-                "universe_size": len(tickers),
-                "num_pass": 0,
-                "adjusted": self.cfg.adjusted,
-                "period": self.cfg.period,
-                "days_win": self.cfg.days_win,
-                "gap_th": self.cfg.gap_th,
-                "adv_min_dollars": self.cfg.adv_min_dollars,
-                "top_k": self.cfg.top_k,
-                "buffer_k": self.cfg.buffer_k,
-                "sector_limits_active": limits_active,
-                "max_per_sector": self.cfg.max_per_sector,
-                "sector_limits": self.cfg.sector_limits,
-                "sector_meta_file": str(self.cfg.sector_meta_file),
-                "selected_sector_counts": {},
-                "fail_counts": dict(self.engine.fail_counts),
-                "aborted_reason": "sp500_below_200dma",
-            }
-            try:
-                self.store.append_jsonl(self.store.runs_meta_jsonl, meta)  # type: ignore[attr-defined]
-            except Exception:
+            if decision["action"] == "HOLD":
+                # -> keep old_w unverändert, Turnover=0
                 pass
-            return
+
+            # Danach: entweder return (wenn du "aborted run" willst)
+            # oder normal weiter, aber mit erzwungenen weights.
+
+        # --- /Regime ---
 
         # === Core-Calc Callbacks ===
         def _get_prices(universe, as_of, period, adjusted):
@@ -575,11 +502,6 @@ class Runner:
         with cp_path.open("w", encoding="utf-8") as f:
             json.dump(asdict(params), f, indent=2, sort_keys=True, default=str)
         logging.debug("RUN CalcParams dump: %s", cp_path)
-
-        # === prev_holdings für Turnover-Buffer (aus letzter positions.csv) ===
-        prev_df = None
-        old_w = {}
-        prev_holdings = []
 
         # === prev_holdings für Turnover-Buffer (aus Snapshot VOR as_of) ===
         prev_df = self.store.load_positions_before(as_of_str)  # <— wichtig: BEFORE!

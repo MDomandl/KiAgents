@@ -133,7 +133,9 @@ def main():
     ap.add_argument("--csv", type=str, help="Pfad für CSV-Diff (Ticker, BT, RUN, Δbps)")
 
     args=ap.parse_args()
-
+    #
+    #„Erster Monat nach - -force = Warm - up, nicht vergleichen“
+    #
     # main():
     if args.dir and args.pair_exact:
         pairs = _exact_pairs(Path(args.dir))

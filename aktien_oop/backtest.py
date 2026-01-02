@@ -15,7 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 from aktien_oop.core_calc import CalcParams, calculate_portfolio
-from .config import normalize_ticker
+from aktien_oop.data_client import DataClient
+from .config import Config
 
 import numpy as np
 import pandas as pd
@@ -74,6 +75,7 @@ class BTConfig:
     dual_benchmark: bool = False
     benchmark2: str = ""
 
+    require_above_sma: bool = False
     regime_use_filter: bool = False
     regime_sma_days: int = 200  # z.B. 200 Kalendertage
     regime_exposure_low: float = 0.50  # z.B. 50% Exposure bei "unter SMA"
@@ -508,6 +510,7 @@ def _period_to_days(period) -> int:
 class Backtester:
     def __init__(self, cfg: BTConfig):
         self.cfg = cfg
+        self.data = DataClient(cfg)
         # -- Universe-Loader: zentral & identisch zum Runner --
         from aktien_oop.universe import load_sp500_tickers, load_sp500_meta
         ufile, mfile = _resolve_universe_paths(self.cfg)
@@ -911,6 +914,7 @@ class Backtester:
 
             # 3) CalcParams aus cfg
             _asof_str = d.strftime("%Y-%m-%d")
+
             cp = CalcParams(
                 as_of=_asof_str,
                 period=getattr(self.cfg, "period", "800d"),
@@ -942,14 +946,28 @@ class Backtester:
                 dump_tag="BT",
             )
 
-            # 4) Core-Call (Selektion/Ranks/Scores)
-            new_w_dict, scores_ser = calculate_portfolio(
-                universe,
-                cp,
-                _get_prices_bt,
-                _get_sectors_bt,
-                prev_holdings=prev_holdings,
-            )
+            decision = self.data.regime_decision(self.cfg, _asof_str)
+            print(f"[DBG][REGIME] as_of={_asof_str} decision={decision}")
+            if not decision["ok"]:
+                if decision["action"] == "HOLD":
+                    new_w_dict = _old_weights_snapshot.copy()
+                    scores_ser = None  # kann None bleiben; optional
+                    # dann Turnover=0, trade_cost=0, usw. (oder einfach im Turnover-Block rauskommt)
+                elif decision["action"] == "SELL":
+                    if bool(getattr(self.cfg, "include_cash", False)):
+                        new_w_dict = {"CASH": 1.0}
+                    else:
+                        new_w_dict = {}
+                # und dann NICHT calculate_portfolio callen
+            else:
+                # 4) Core-Call (Selektion/Ranks/Scores)
+                new_w_dict, scores_ser = calculate_portfolio(
+                    universe,
+                    cp,
+                    _get_prices_bt,
+                    _get_sectors_bt,
+                    prev_holdings=prev_holdings,
+                )
 
             self._dbg(
                 f"[BT/DBG] core_new_w_len={len(new_w_dict)} "
@@ -1602,6 +1620,8 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         "aktien_oop/decisions",
     )
 
+    regime = d.get("regime") or {}
+
     return BTConfig(
         tickers_file     = _coalesce(a.tickers,           d.get("tickers_file"),   "aktien_oop/sp500_tickers.txt"),
         sector_meta      = _coalesce(a.sector_meta,       d.get("sector_meta"),    None),
@@ -1654,6 +1674,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
                            63),
 
         # Regime
+        require_above_sma=_coalesce(getattr(regime, "require_above_sma", None), regime.get("require_above_sma"), False),
         regime_use_filter=_coalesce(
             (a.regime_use_filter if getattr(a, "regime_use_filter", False) else None),
             d.get("regime_use_filter"),

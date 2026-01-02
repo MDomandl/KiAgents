@@ -11,7 +11,6 @@ sector_meta_file = "aktien_oop/sp500_meta.csv"
 [filters]
 gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
 sma_window   = 200
-require_above_sma = false #..... true
 
 [windows]
 score_days = 200
@@ -22,4 +21,9 @@ adjusted = true
 
 [limits]
 gap_filter = 0.0   # 0.12 .... normal
+
+[regime]
+require_above_sma = true
+regime_sma_days = 200
+regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
 

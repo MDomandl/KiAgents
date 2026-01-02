@@ -68,4 +68,9 @@ use_equal_weight = false
 [filters]
 gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
 sma_window   = 200
-require_above_sma = false  #....true
+
+[regime]
+require_above_sma = true
+regime_sma_days = 200
+regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
+

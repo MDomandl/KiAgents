@@ -4,13 +4,19 @@ from typing import Optional
 
 import pandas as pd
 import yfinance as yf
+from dataclasses import dataclass
 
 from .config import Config, normalize_ticker
+from typing import Any
 from .utils import as_series
 
+@dataclass(frozen=True)
+class RegimeDecision:
+    ok: bool
+    reason: str | None = None
 
 class DataClient:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Any):
         self.cfg = cfg
 
     @staticmethod
@@ -133,63 +139,81 @@ class DataClient:
         return mat
 
     # ---------- FIX 3: Series/Scalar robust (keine ambige truth values) ----------
-    def sp500_above_200dma(self) -> bool:
-        """
-        True, wenn S&P500 (ˆGSPC) über seinem 200DMA liegt – as_of-korrekt.
-        Robust gegen yfinance MultiIndex/Series-Probleme.
-        """
-        kw = dict(
-            interval="1d",
-            progress=False,
-            auto_adjust=bool(getattr(self.cfg, "adjusted", True)),
-            threads=False,
-        )
+    def sp500_above_200dma(self, as_of: str, sma_days: int = 200, period: str = "800d") -> bool:
+        as_of_ts = pd.Timestamp(as_of).normalize()
 
-        cfg_as_of = getattr(self.cfg, "as_of", None)
-        cfg_period = getattr(self.cfg, "period", "800d")
+        px = yf.download("^GSPC", period=period, auto_adjust=False, progress=False)
+        if px is None or getattr(px, "empty", True):
+            return True  # defensiv
 
-        if cfg_as_of:
-            cutoff = pd.to_datetime(cfg_as_of).tz_localize(None).normalize()
+        # ---- Close als 1D-Series extrahieren (robust) ----
+        close = None
 
-            # Fenster: aus period ableiten (Lockstep-Idee), aber mind. ~300d,
-            # damit 200DMA sicher berechenbar bleibt.
-            days = max(self._period_to_days(cfg_period), 300)
+        # Fall A: normale Spalten ("Open", "High", ..., "Close")
+        if isinstance(px, pd.DataFrame) and "Close" in px.columns:
+            close = px["Close"]
 
-            start = (cutoff - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-            end = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # yfinance 'end' ist exklusiv
-            df = yf.download("^GSPC", start=start, end=end, **kw)
-        else:
-            # ohne as_of: period-basiert, aber mindestens 300d
-            days = max(self._period_to_days(cfg_period), 300)
-            df = yf.download("^GSPC", period=f"{days}d", **kw)
+        # Fall B: MultiIndex-Spalten (z.B. ("Close", "^GSPC"))
+        if close is None and isinstance(px, pd.DataFrame) and isinstance(px.columns, pd.MultiIndex):
+            if ("Close", "^GSPC") in px.columns:
+                close = px[("Close", "^GSPC")]
+            else:
+                # fallback: nimm alle "Close"-Spalten und squeeze auf eine
+                try:
+                    close = px.xs("Close", axis=1, level=0)
+                except Exception:
+                    close = None
 
-        if df is None or df.empty or "Close" not in df.columns:
-            logging.warning("S&P 500: keine Daten erhalten.")
-            return False
+        if close is None:
+            return True
 
-        close = df["Close"]
-        # yfinance kann hier DataFrame (MultiIndex) oder Series liefern → auf Series normieren
+        # close kann jetzt Series ODER DataFrame sein -> auf Series bringen
         if isinstance(close, pd.DataFrame):
+            if close.shape[1] == 0:
+                return True
             close = close.iloc[:, 0]
 
-        close = pd.to_numeric(close, errors="coerce").dropna()
-        if len(close) < 200:
-            logging.warning("S&P 500: zu wenige Close-Werte für 200DMA.")
-            return False
+        close = close.dropna()
+        close = close[close.index <= as_of_ts]
+        if close.empty:
+            return True
 
-        sma200 = close.rolling(200, min_periods=200).mean().dropna()
-        if sma200.empty:
-            logging.warning("S&P 500: 200DMA nicht berechenbar (empty).")
-            return False
+        sma = close.rolling(sma_days).mean()
 
-        last_close = float(close.iloc[-1])
-        last_sma = float(sma200.iloc[-1])
+        # ---- Scalars erzwingen ----
+        last_close = close.iloc[-1]
+        if isinstance(last_close, pd.Series):
+            last_close = last_close.iloc[0]
+        last_close = float(last_close)
 
-        logging.info(
-            f"S&P 500 → Close: {last_close:.2f} | 200DMA: {last_sma:.2f} | Markt "
-            f"{'über' if last_close > last_sma else 'unter'} 200DMA"
-        )
+        last_sma = sma.iloc[-1]
+        if isinstance(last_sma, pd.Series):
+            last_sma = last_sma.iloc[0]
+
+        if pd.isna(last_sma):
+            return True
+
+        last_sma = float(last_sma)
+
         return last_close > last_sma
+
+    def regime_decision(self, cfg, as_of: str) -> dict:
+        require = bool(getattr(cfg, "require_above_sma", False))
+        if not require:
+            return {"ok": True, "reason": "", "action": "PROCEED"}
+
+        sma_days = int(getattr(cfg, "regime_sma_days", getattr(cfg, "sma_days", 200)) or 200)
+        period = str(getattr(cfg, "period", "800d") or "800d")
+
+        ok = self.sp500_above_200dma(as_of=as_of, sma_days=sma_days, period=period)
+        if ok:
+            return {"ok": True, "reason": "", "action": "PROCEED"}
+
+        action = str(getattr(cfg, "regime_below_action", "HOLD") or "HOLD").upper()
+        if action not in ("HOLD", "SELL"):
+            action = "HOLD"
+
+        return {"ok": False, "reason": "sp500_below_200dma", "action": action}
 
     def load_prices(self, universe, as_of, period, adjusted=True):
         return self.get_prices(universe, as_of, period, adjusted)

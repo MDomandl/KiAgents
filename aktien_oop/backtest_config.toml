@@ -66,7 +66,6 @@ regime_use_filter   = false  # true .....
 regime_sma_days     = 200
 regime_exposure_low = 0.65     # nur 60% Exposure, wenn Benchmark < SMA200
 
-
 # Volatility Targeting (optional)
 vol_target_ann      = 0.00   #  0.20 ......
 vol_lookback_days   = 20
@@ -91,3 +90,9 @@ as_of  = "2025-10-10"
 [windows]
 score_days = 200
 vol_days   = 63
+
+[regime]
+require_above_sma = true
+regime_sma_days = 200
+regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
+
