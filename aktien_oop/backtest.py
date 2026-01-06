@@ -76,6 +76,7 @@ class BTConfig:
     benchmark2: str = ""
 
     require_above_sma: bool = False
+    regime_below_action: str = "HOLD"
     regime_use_filter: bool = False
     regime_sma_days: int = 200  # z.B. 200 Kalendertage
     regime_exposure_low: float = 0.50  # z.B. 50% Exposure bei "unter SMA"
@@ -1621,6 +1622,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
     )
 
     regime = d.get("regime") or {}
+    limits = d.get("limits") or {}
 
     return BTConfig(
         tickers_file     = _coalesce(a.tickers,           d.get("tickers_file"),   "aktien_oop/sp500_tickers.txt"),
@@ -1680,9 +1682,14 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
             d.get("regime_use_filter"),
             False
         ),
+        regime_below_action = _coalesce(
+            getattr(regime, "regime_below_action", None),
+            regime.get("regime_below_action"),
+            "HOLD"
+        ),
         regime_sma_days=_coalesce(
-            getattr(a, "regime_sma_days", None),
-            d.get("regime_sma_days"),
+            getattr(regime, "regime_sma_days", None),
+            regime.get("regime_sma_days"),
             200
         ),
         regime_exposure_low=_coalesce(
@@ -1702,9 +1709,17 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
             d.get("vol_lookback_days"),
             20
         ),
-
-        include_cash=_coalesce(a.include_cash if getattr(a, "include_cash", False) else None,
-                               d.get("include_cash"), False),
+        include_cash=_coalesce(
+            (limits.include_cash if getattr(limits, "include_cash", False) else None),
+            limits.get("include_cash"),
+            False
+        ),
+        # include_cash=_coalesce(limits.include_cash if limits.include_cash else None, limits.get("include_cash"),False),
+        # include_cash=_coalesce(
+        #     getattr(a, "include_cash", None),
+        #     d.get("include_cash"),
+        #     False
+        # ),
         cash_yield_annual=_coalesce(getattr(a, "cash_yield_annual", None),
                                     d.get("cash_yield_annual"), 0.0),
 

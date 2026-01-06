@@ -71,7 +71,7 @@ vol_target_ann      = 0.00   #  0.20 ......
 vol_lookback_days   = 20
 
 # --- Benchmarks ---
-dual_benchmark = true
+dual_benchmark = false
 benchmark_ticker  = "SPY"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 benchmark2  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 
@@ -79,7 +79,9 @@ benchmark2  = "SXR8.DE"   # z.B. "SXR8.DE" für thesaurierenden S&P500 in EUR
 rebalance_every_n  = 1         # nur jeden 2. Termin wirklich traden
 
 # --- Cash ---
-include_cash      = false      # true ..... explizites CASH-Gewicht als Residuum führen
+# SELL + include_cash=true  -> risk-off (100% CASH)
+# SELL + include_cash=false -> flat portfolio (no exposure, no yield)
+include_cash      = true      # true ..... explizites CASH-Gewicht als Residuum führen
 cash_yield_annual = 0.00      # 0.02 = 2% p.a.; 0.00 = zinsloses Cash
 max_weight_per_name = 1.0   # 0.30 .... 25% pro Name
 
@@ -92,7 +94,14 @@ score_days = 200
 vol_days   = 63
 
 [regime]
+# Regime-Filter: S&P500 muss über SMA liegen, sonst greift die Policy unten
 require_above_sma = true
+# Anzahl Tage für die SMA des Regime-Indikators (z. B. S&P 500)
 regime_sma_days = 200
-regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
+# SELL + include_cash=true  -> risk-off (100% CASH)
+# SELL + include_cash=false -> flat portfolio (no exposure, no yield)
+# Aktion, wenn das Regime NICHT erfüllt ist (ok == false):
+# - HOLD : Portfolio unverändert weiterführen (keine Umschichtung)
+# - SELL : Alle Positionen schließen (Cash / Flat)
+regime_below_action = "SELL"  # "SELL" | "HOLD"
 

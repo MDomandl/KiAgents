@@ -77,7 +77,6 @@ class RunCfgNormalized:
     max_per_sector: int | None
 
     # Cash / Reibung / Rundung
-    include_cash: bool
     eps: float               # absolute Friction (z.B. 0.0)
     eps_pct: float           # prozentuale Friction (z.B. 0.0)
     cap: float               # Turnover-Cap (0.0 = aus)
@@ -125,7 +124,7 @@ class Runner:
                     pass
         return {k: v for k, v in d.items() if v > 0}
 
-    def _write_decision_bundle(self, as_of_raw, old_w, new_w) -> None:
+    def _write_decision_bundle(self, as_of_raw, old_w, new_w, decision=None, turnover_raw=None, turnover_eff=None) -> None:
         """
         Schreibt das Runner-Decision-Bundle als JSON.
         Stellt sicher, dass:
@@ -159,8 +158,18 @@ class Runner:
             "as_of": as_of_str,
             "old_weights": _series_to_dict(old_w),
             "new_weights": _series_to_dict(new_w),
+            "turnover_raw": float(turnover_raw) if turnover_raw is not None else None,
+            "turnover_eff": float(turnover_eff) if turnover_eff is not None else None,
         }
 
+        if isinstance(decision, dict):
+            bundle["regime"] = {
+                "ok": bool(decision.get("ok", True)),
+                "action": str(decision.get("action", "")),
+                "reason": str(decision.get("reason", "")),
+                # optional, falls du es ergänzt hast:
+                "below_action": str(decision.get("below_action", "")),
+            }
         # 4) Dateiname nur mit sauberem Datumsteil
         out = ddir / f"{prefix}_{run_ts}_{as_of_str}.json"
 
@@ -358,17 +367,6 @@ class Runner:
     # Main
     # ---------------------------
     def run(self) -> None:
-        # --- AS-OF zentral ---
-        as_of_ts = (pd.Timestamp(self.cfg.as_of).normalize()
-                    if getattr(self.cfg, "as_of", None)
-                    else pd.Timestamp.today().normalize())
-        as_of_str = as_of_ts.strftime("%Y-%m-%d")
-        # NEU: Stichtag an DataClient/Engine durchreichen (Duck-Typing)
-        for obj in (self.data, self.engine):
-            if hasattr(obj, "set_as_of"):
-                obj.set_as_of(as_of_ts)
-            elif hasattr(obj, "as_of"):
-                setattr(obj, "as_of", as_of_ts)
 
         # optional: run_id einmalig
         setup_logging(self.cfg.verbose, lib_debug=self.cfg.lib_debug, log_file=self.cfg.save_dir / "run.log")
@@ -382,9 +380,24 @@ class Runner:
 
         # === NORMALIZE (Runner) – nur noch über _normalize_cfg ===
         cfg = self.cfg
+        #_assign_attr(cfg, "as_of", str((cfg.__getattribute__("core"))["as_of"]))
+        # --- AS-OF zentral ---
+        as_of_ts = (pd.Timestamp(self.cfg.as_of).normalize()
+                    if getattr(self.cfg, "as_of", None)
+                    else pd.Timestamp.today().normalize())
+        as_of_str = as_of_ts.strftime("%Y-%m-%d")
+        # NEU: Stichtag an DataClient/Engine durchreichen (Duck-Typing)
+        for obj in (self.data, self.engine):
+            if hasattr(obj, "set_as_of"):
+                obj.set_as_of(as_of_ts)
+            elif hasattr(obj, "as_of"):
+                setattr(obj, "as_of", as_of_ts)
 
         norm = self._normalize_cfg(as_of_str=as_of_str)
-
+        _assign_attr(cfg, "regime_below_action", str((cfg.__getattribute__("regime"))["regime_below_action"]))
+        _assign_attr(cfg, "require_above_sma", bool((cfg.__getattribute__("regime"))["require_above_sma"]))
+        _assign_attr(cfg, "regime_sma_days", int((cfg.__getattribute__("regime"))["regime_sma_days"]))
+        _assign_attr(cfg, "include_cash", bool((cfg.__getattribute__("regime"))["include_cash"]))
         # Relevante Felder zurück ins cfg spiegeln, damit Logs/Store konsistent sind
         _assign_attr(cfg, "score_days", int(norm["score_days"]))
         _assign_attr(cfg, "vol_days", int(norm["vol_days"]))
@@ -478,6 +491,13 @@ class Runner:
             # identische Meta wie oben geladen (sector_map)
             return {t: sector_map.get(t, "UNKNOWN") for t in universe}
 
+        def _turnover(old_d: dict, new_d: dict) -> float:
+            keys = set(old_d.keys()) | set(new_d.keys())
+            s = 0.0
+            for k in keys:
+                s += abs(float(old_d.get(k, 0.0)) - float(new_d.get(k, 0.0)))
+            return s / 2.0
+
         # === CalcParams aus normalisierter cfg ===
         cfg = self.cfg  # Kurzalias
 
@@ -533,10 +553,37 @@ class Runner:
             logging.debug("Price matrix shape=%s first=%s last=%s nonNaCols=%d",
                           tuple(probe.shape), str(first_dt), str(last_dt), non_na_cols)
 
+        # --- REGIME (Runner) ---
+        # Wichtig: params.as_of kann Timestamp sein -> als YYYY-MM-DD string normieren
+        as_of_regime = pd.Timestamp(params.as_of).strftime("%Y-%m-%d")
+
+        decision = self.data.regime_decision(self.cfg, as_of_regime)
+        logging.info("[DBG][REGIME][RUN] as_of=%s decision=%s", as_of_regime, decision)
+
+        action = str(decision.get("action", "PROCEED") or "PROCEED").upper()
+        # ------------------------
+
         # Jetzt erst der Core-Call:
-        weights, scores = calculate_portfolio(
-            tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
-        )
+        if action == "PROCEED":
+            weights, scores = calculate_portfolio(
+                tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
+            )
+        else:
+            # HOLD / SELL -> kein Core Call
+            scores = None
+            if action == "HOLD":
+                # Portfolio unverändert weiterführen
+                weights = dict(old_w)  # old_w ist dein Snapshot BEFORE as_of
+            elif action == "SELL":
+                if bool(getattr(self.cfg, "include_cash", False)):
+                    weights = {"CASH": 1.0}
+                else:
+                    weights = {}
+            else:
+                # defensiver Fallback
+                weights, scores = calculate_portfolio(
+                    tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
+                )
 
         debug_dir = Path("aktien_oop/debug")
         debug_dir.mkdir(exist_ok=True, parents=True)
@@ -581,9 +628,14 @@ class Runner:
         # === 'sel' DataFrame aus den Ergebnissen bauen (für deine Logs/Output) ===
         sel_ticks = list(weights.keys())
         sel = pd.DataFrame({"ticker": sel_ticks})
-        sel["score"] = sel["ticker"].map(lambda t: float(scores.get(t, np.nan)))
-        # Rank nur innerhalb der Auswahl:
-        sel["rank"] = sel["score"].rank(ascending=False, method="first").astype("Int64")
+
+        if isinstance(scores, (pd.Series, dict)):
+            sel["score"] = sel["ticker"].map(lambda t: float(scores.get(t, np.nan)))
+            sel["rank"] = sel["score"].rank(ascending=False, method="first").astype("Int64")
+        else:
+            sel["score"] = np.nan
+            # bei HOLD/SELL ist rank nicht wirklich relevant -> 1 als Fallback oder NaN
+            sel["rank"] = 1
 
         # Allocation in Prozent (weights sind 0..1)
         w_pct = {t: 100.0 * float(w) for t, w in weights.items()}
@@ -630,10 +682,16 @@ class Runner:
             ticks = self.load_tickers()
             univ_sha = hashlib.sha1(("|".join(sorted(map(str, ticks)))).encode()).hexdigest()
 
+            old_w_dict = old_w  # dict
+            new_w_dict = weights  # dict
+            turnover_raw = _turnover(old_w_dict, new_w_dict)
+            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+            turnover_eff = min(turnover_raw, cap) if cap > 0 else turnover_raw
+
             logging.info(
                 "[LOCKSTEP][RUN] as_of=%s top_k=%d buffer_k=%d use_sector_limits=%s max_per_sector=%s "
                 "score_days=%d vol_days=%d adjusted=%s universe_len=%d sha=%s",
-                norm["as_of"],
+                as_of_str,
                 self.cfg.top_k,
                 self.cfg.buffer_k,
                 norm["use_sector_limits"],
@@ -648,7 +706,14 @@ class Runner:
             # --- /LOCKSTEP ---
 
             # Bundle schreiben – nutzt den oben berechneten as_of_str
-            self._write_decision_bundle(norm["as_of"], old_w, new_w)
+            self._write_decision_bundle(
+                as_of_str,
+                old_w_dict,
+                new_w_dict,
+                decision=decision,
+                turnover_raw=turnover_raw,
+                turnover_eff=turnover_eff,
+            )
 
         self.store.append_csv(self.store.topk_log, sel)
         run_row = pd.DataFrame([{

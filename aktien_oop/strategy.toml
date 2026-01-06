@@ -25,5 +25,5 @@ gap_filter = 0.0   # 0.12 .... normal
 [regime]
 require_above_sma = true
 regime_sma_days = 200
-regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
+regime_below_action = "SELL"  # "SELL" | "HOLD" | "skip_rebalance"
 

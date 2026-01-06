@@ -129,8 +129,7 @@ class Config:
     dump_decision_bundles: bool = True
     decisions_dir: Path = PKG_ROOT / "decisions"
     decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
-
-    as_of: str | None = None
+    as_of: str = ""
     max_lookback_days: int = 360  # Sicherheits-Puffer, falls as_of genutzt wird
 
     @property
@@ -197,6 +196,7 @@ class Config:
         lim_cfg = cfg_toml.get("limits", {}) or {}
         reb_cfg = cfg_toml.get("rebalance", {}) or {}
         topk_cfg = cfg_toml.get("topk", {}) or {}
+        regime_cfg = cfg_toml.get("regime", {}) or {}
 
         # flaches Dict für „einfache“ Keys (Top-Level + core + limits etc.)
         d: dict = dict(cfg_toml)
@@ -231,9 +231,6 @@ class Config:
 
         if "max_turnover_cap" in lim_cfg:
             d.setdefault("max_turnover_cap", lim_cfg["max_turnover_cap"])
-
-        if "include_cash" in lim_cfg:
-            d.setdefault("include_cash", lim_cfg["include_cash"])
 
         if "cost_bps" in lim_cfg:
             d.setdefault("cost_bps", lim_cfg["cost_bps"])
@@ -294,9 +291,8 @@ class Config:
             verbose=_bool_merge(args.verbose, "verbose", cls.verbose),
             lib_debug=_bool_merge(args.lib_debug, "lib_debug", cls.lib_debug),
             force_rebalance=_bool_merge(args.force_rebalance, "force_rebalance", cls.force_rebalance),
-
-            period=period,
             as_of=as_of,
+            period=period,
             max_lookback_days=max_lookback_days,
 
             dump_decision_bundles=_bool_merge(args.dump_decision_bundles,
@@ -315,6 +311,7 @@ class Config:
         object.__setattr__(cfg, "windows", win_cfg)
         object.__setattr__(cfg, "limits", lim_cfg)
         object.__setattr__(cfg, "rebalance", reb_cfg)
+        object.__setattr__(cfg, "regime", regime_cfg)
 
         # sinnvolle Fallbacks für score_days/vol_days direkt am cfg
         if "score_days" in d:

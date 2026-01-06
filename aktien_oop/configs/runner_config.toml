@@ -19,8 +19,8 @@ dump_scores = true
 dump_tag = "RUN"
 
 [core]
-period = "800d"
-as_of = "2025-10-08"
+period = "801d"
+as_of = "2025-04-30"
 
 [windows]
 score_days = 200
@@ -55,7 +55,6 @@ max_turnover_cap   = 0.40
 
 # Cash & Kosten kannst du optional anpassen;
 # fürs Matching sind sie nachrangig, aber schaden nicht:
-include_cash     = true
 cost_bps         = 0
 slippage_bps     = 7.0
 
@@ -70,7 +69,13 @@ gap_max_days = 0        # oder: gap_pct_max = 0.0 (je nach Implementierung)
 sma_window   = 200
 
 [regime]
+include_cash     = true
+# Regime-Filter: S&P500 muss über SMA liegen, sonst greift die Policy unten
 require_above_sma = true
+# Anzahl Tage für die SMA des Regime-Indikators (z. B. S&P 500)
 regime_sma_days = 200
-regime_below_action = "HOLD"  # "SELL" | "HOLD" | "skip_rebalance"
+# Aktion, wenn das Regime NICHT erfüllt ist (ok == false):
+# - HOLD : Portfolio unverändert weiterführen (keine Umschichtung)
+# - SELL : Alle Positionen schließen (Cash / Flat)
+regime_below_action = "SELL"  # "SELL" | "HOLD"
 

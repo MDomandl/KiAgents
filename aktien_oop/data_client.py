@@ -199,21 +199,27 @@ class DataClient:
 
     def regime_decision(self, cfg, as_of: str) -> dict:
         require = bool(getattr(cfg, "require_above_sma", False))
-        if not require:
-            return {"ok": True, "reason": "", "action": "PROCEED"}
 
-        sma_days = int(getattr(cfg, "regime_sma_days", getattr(cfg, "sma_days", 200)) or 200)
+        # Action immer normieren (Default HOLD), damit Caller immer ein Feld hat
+
+        action_below = str(getattr(cfg, "regime_below_action", "HOLD") or "HOLD").upper()
+        if action_below not in ("HOLD", "SELL"):
+            action_below = "HOLD"
+
+        # Wenn Regime nicht aktiv: immer proceed
+        if not require:
+            return {"ok": True, "reason": "", "action": "PROCEED", "below_action": action_below}
+
+        sma_days = int(getattr(cfg, "regime_sma_days", 200) or 200)
         period = str(getattr(cfg, "period", "800d") or "800d")
 
         ok = self.sp500_above_200dma(as_of=as_of, sma_days=sma_days, period=period)
         if ok:
-            return {"ok": True, "reason": "", "action": "PROCEED"}
+            # Hier explizit action setzen, damit Caller nicht raten muss
+            return {"ok": True, "reason": "", "action": "PROCEED", "below_action": action_below}
 
-        action = str(getattr(cfg, "regime_below_action", "HOLD") or "HOLD").upper()
-        if action not in ("HOLD", "SELL"):
-            action = "HOLD"
-
-        return {"ok": False, "reason": "sp500_below_200dma", "action": action}
+        # Regime ist aktiv und nicht ok -> below_action anwenden
+        return {"ok": False, "reason": "sp500_below_200dma", "action": action_below, "below_action": action_below}
 
     def load_prices(self, universe, as_of, period, adjusted=True):
         return self.get_prices(universe, as_of, period, adjusted)
