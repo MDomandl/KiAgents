@@ -124,7 +124,8 @@ class Runner:
                     pass
         return {k: v for k, v in d.items() if v > 0}
 
-    def _write_decision_bundle(self, as_of_raw, old_w, new_w, decision=None, turnover_raw=None, turnover_eff=None) -> None:
+    def _write_decision_bundle(self, as_of_raw, old_w, new_w, *, regime=None, turnover_raw=None, turnover_eff=None, first_run_no_prev_state=False) -> None:
+
         """
         Schreibt das Runner-Decision-Bundle als JSON.
         Stellt sicher, dass:
@@ -160,16 +161,11 @@ class Runner:
             "new_weights": _series_to_dict(new_w),
             "turnover_raw": float(turnover_raw) if turnover_raw is not None else None,
             "turnover_eff": float(turnover_eff) if turnover_eff is not None else None,
+            "first_run_no_prev_state": bool(first_run_no_prev_state),
         }
 
-        if isinstance(decision, dict):
-            bundle["regime"] = {
-                "ok": bool(decision.get("ok", True)),
-                "action": str(decision.get("action", "")),
-                "reason": str(decision.get("reason", "")),
-                # optional, falls du es ergänzt hast:
-                "below_action": str(decision.get("below_action", "")),
-            }
+        if isinstance(regime, dict):
+            bundle["regime"] = regime
         # 4) Dateiname nur mit sauberem Datumsteil
         out = ddir / f"{prefix}_{run_ts}_{as_of_str}.json"
 
@@ -524,9 +520,16 @@ class Runner:
         logging.debug("RUN CalcParams dump: %s", cp_path)
 
         # === prev_holdings für Turnover-Buffer (aus Snapshot VOR as_of) ===
-        prev_df = self.store.load_positions_before(as_of_str)  # <— wichtig: BEFORE!
+        prev_df = self.store.load_positions_before(as_of_str)  # BEFORE!
         old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
         prev_holdings = list(old_w.keys())
+
+        is_first_run = (prev_df is None) or (len(prev_df) == 0)
+        if is_first_run:
+            logging.info(
+                "[RUN] first_run_no_prev_state=True (no positions before as_of=%s)",
+                as_of_str
+            )
 
         logging.debug("prev_df rows=%s cols=%s",
                       0 if prev_df is None else len(prev_df),
@@ -684,9 +687,16 @@ class Runner:
 
             old_w_dict = old_w  # dict
             new_w_dict = weights  # dict
-            turnover_raw = _turnover(old_w_dict, new_w_dict)
-            cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
-            turnover_eff = min(turnover_raw, cap) if cap > 0 else turnover_raw
+            turnover_raw = None
+            turnover_eff = None
+            if not is_first_run:
+                turnover_raw = _turnover(old_w_dict, new_w_dict)
+                cap = float(getattr(self.cfg, "max_turnover_cap", 0.0) or 0.0)
+                turnover_eff = min(turnover_raw, cap) if cap > 0 else turnover_raw
+            else:
+                # First-Run: Turnover bewusst nicht definieren
+                turnover_raw = None
+                turnover_eff = None
 
             logging.info(
                 "[LOCKSTEP][RUN] as_of=%s top_k=%d buffer_k=%d use_sector_limits=%s max_per_sector=%s "
@@ -707,12 +717,13 @@ class Runner:
 
             # Bundle schreiben – nutzt den oben berechneten as_of_str
             self._write_decision_bundle(
-                as_of_str,
-                old_w_dict,
-                new_w_dict,
-                decision=decision,
+                as_of_str,  # besser als norm["as_of"], weil ggf. gepadded auf last_dt
+                old_w,
+                weights,  # direkt die dict-weights nehmen
+                regime=decision,  # falls du decision schon erzeugst (HOLD/SELL/PROCEED)
                 turnover_raw=turnover_raw,
                 turnover_eff=turnover_eff,
+                first_run_no_prev_state=is_first_run,
             )
 
         self.store.append_csv(self.store.topk_log, sel)

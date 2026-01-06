@@ -36,6 +36,10 @@ def _infer_to(old_w, new_w):
 
 def _cmp(bt_p: Path, run_p: Path, tol_bps=5.0, ignore_cash=False, args=None):
     bt=_load(bt_p); rn=_load(run_p)
+
+    bt_first = bool(bt.get("first_run_no_prev_state", False))
+    rn_first = bool(rn.get("first_run_no_prev_state", False))
+
     d_bt = bt.get("as_of") or _date_from_name(bt_p)
     d_rn = rn.get("as_of") or _date_from_name(run_p)
 
@@ -67,9 +71,26 @@ def _cmp(bt_p: Path, run_p: Path, tol_bps=5.0, ignore_cash=False, args=None):
     mean_abs=(sum(diffs)/len(diffs)) if diffs else 0.0
     l1_bps=_bps(sum(abs(bt_new.get(k,0.0)-rn_new.get(k,0.0)) for k in keys))
 
-    bt_to=bt.get("turnover") or bt.get("turnover_eff") or _infer_to(bt_old,bt_new)
-    rn_to=rn.get("turnover") or rn.get("turnover_eff") or _infer_to(rn_old,rn_new)
-    to_diff_bps=_bps(bt_to-rn_to)
+    # Turnover: optional vergleichen (First-Run/No-Prev-State überspringen)
+    def _get_to(bundle, old_d, new_d):
+        # bevorzugt explizite Felder, fallback auf infer
+        v = bundle.get("turnover") if bundle.get("turnover") is not None else None
+        if v is None:
+            v = bundle.get("turnover_eff") if bundle.get("turnover_eff") is not None else None
+        if v is None:
+            v = bundle.get("turnover_raw") if bundle.get("turnover_raw") is not None else None
+        if v is None:
+            v = _infer_to(old_d, new_d)
+        return float(v)
+
+    skip_to = bt_first or rn_first
+    bt_to = rn_to = None
+    to_diff_bps = 0.0
+
+    if not skip_to:
+        bt_to = _get_to(bt, bt_old, bt_new)
+        rn_to = _get_to(rn, rn_old, rn_new)
+        to_diff_bps = _bps(bt_to - rn_to)
 
     print(f"\n=== BT: {bt_p.name} ({d_bt})  vs  RUN: {run_p.name} ({d_rn}) ===")
     if only_bt or only_rn:
@@ -97,8 +118,18 @@ def _cmp(bt_p: Path, run_p: Path, tol_bps=5.0, ignore_cash=False, args=None):
                 w.writerow([k, f"{bt_new.get(k, 0.0):.6f}", f"{rn_new.get(k, 0.0):.6f}", f"{d:.1f}"])
         print(f"(CSV) geschrieben: {csv_out}")
 
-    print(f"Turnover: BT={bt_to:.4f}  RUN={rn_to:.4f}  Δ={to_diff_bps:+.1f} bps")
-    return not(only_bt or only_rn or offenders or abs(to_diff_bps)>tol_bps)
+    if skip_to:
+        who = []
+        if bt_first: who.append("BT")
+        if rn_first: who.append("RUN")
+        print(f"Turnover: SKIP (first_run_no_prev_state in {','.join(who)})")
+        to_fail = False
+    else:
+        print(f"Turnover: BT={bt_to:.4f}  RUN={rn_to:.4f}  Δ={to_diff_bps:+.1f} bps")
+        to_fail = abs(to_diff_bps) > tol_bps
+
+    return not (only_bt or only_rn or offenders or to_fail)
+
 
 def _nearest_pairs(dec_dir: Path, within_days=7):
     bt, rn = [], []
