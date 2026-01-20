@@ -77,7 +77,6 @@ class BTConfig:
 
     require_above_sma: bool = False
     regime_below_action: str = "HOLD"
-    regime_use_filter: bool = False
     regime_sma_days: int = 200  # z.B. 200 Kalendertage
     regime_exposure_low: float = 0.50  # z.B. 50% Exposure bei "unter SMA"
 
@@ -542,7 +541,11 @@ class Backtester:
             return default
 
         def _get(obj, name, default=None):
-            return getattr(obj, name, default) if obj is not None else default
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                return obj.get(name, default)
+            return getattr(obj, name, default)
         # --- NORMALIZE (Backtester) ---
         def _assign(obj, name, value):
             try:
@@ -585,8 +588,8 @@ class Backtester:
         _assign(cfg, "buffer_k", int(buffer_k))
         _assign(cfg, "max_per_sector", int(mps) if mps is not None else None)
         _assign(cfg, "use_sector_limits", bool(use_sl))
-        _assign(cfg, "days_win", int(score_days))
-        _assign(cfg, "vol_win", int(vol_days))
+        _assign(cfg, "score_days", int(score_days))
+        _assign(cfg, "vol_days", int(vol_days))
         _assign(cfg, "adjusted", bool(adjusted))
         # --- /NORMALIZE ---
 
@@ -628,7 +631,7 @@ class Backtester:
         feats = compute_features(px)
 
         # --- Regime-Filter vorbereiten (optional) ---
-        regime_on = bool(getattr(self.cfg, "regime_use_filter", False))
+        regime_on = bool(getattr(self.cfg, "require_above_sma", False))
         bm_s = None
         bm_sma = None
         if regime_on:
@@ -641,7 +644,7 @@ class Backtester:
                 s = s[~s.index.duplicated()].sort_index()
                 # Zeitbasiertes Rolling: letzte N Kalendertage
                 N = int(self.cfg.regime_sma_days)
-                sma = s.rolling(window=f"{N}D").mean()
+                sma = s.rolling(window=N).mean()
                 bm_s, bm_sma = s, sma
             else:
                 regime_on = False
@@ -1552,8 +1555,11 @@ def _load_toml(path: str) -> dict:
         return tomllib.load(f)
 
 
-def _coalesce(cli_val, cfg_val, default):
-    return cli_val if cli_val is not None else (cfg_val if cfg_val is not None else default)
+def _coalesce(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
 
 def _first_not_none(*vals):
     """Gibt den ersten Wert zurück, der nicht None ist (ansonsten None)."""
@@ -1563,10 +1569,10 @@ def _first_not_none(*vals):
     return None
 
 def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
-    d = _load_toml(a.config) if a.config else {}
+    cfg_toml = _load_toml(a.config) if a.config else {}
 
     # --- Fenster aus [windows] lesen, falls vorhanden ---
-    win = d.get("windows") or {}
+    win = cfg_toml.get("windows") or {}
     if isinstance(win, dict):
         win_score_days = win.get("score_days")
         win_vol_days = win.get("vol_days")
@@ -1583,24 +1589,24 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
     bm_primary = _first_not_none(
         getattr(a, "benchmark", None),
         getattr(a, "benchmark_ticker", None),
-        d.get("benchmark"),
-        d.get("benchmark_ticker"),
-        d.get("benchmark-ticker"),
+        cfg_toml.get("benchmark"),
+        cfg_toml.get("benchmark_ticker"),
+        cfg_toml.get("benchmark-ticker"),
         "SXR8.DE",
     )
 
     bm_dual = _first_not_none(
         cli_dual,
-        d.get("dual_benchmark"),
-        d.get("dual-benchmark"),
+        cfg_toml.get("dual_benchmark"),
+        cfg_toml.get("dual-benchmark"),
         False,
     )
 
     bm_secondary = _first_not_none(
         getattr(a, "benchmark2", None),
-        d.get("benchmark2"),
-        d.get("benchmark_2"),
-        d.get("benchmark-2"),
+        cfg_toml.get("benchmark2"),
+        cfg_toml.get("benchmark_2"),
+        cfg_toml.get("benchmark-2"),
         "",
     )
 
@@ -1610,48 +1616,61 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
 
     dump_bundles = _first_not_none(
         getattr(a, "dump_decisions", None),
-        d.get("dump_decision_bundles"),
-        d.get("dump-decisions"),
+        cfg_toml.get("dump_decision_bundles"),
+        cfg_toml.get("dump-decisions"),
         False,
     )
     dec_dir = _first_not_none(
         getattr(a, "decisions_dir", None),
-        d.get("decisions_dir"),
-        d.get("decisions-dir"),
+        cfg_toml.get("decisions_dir"),
+        cfg_toml.get("decisions-dir"),
         "aktien_oop/decisions",
     )
 
-    regime = d.get("regime") or {}
-    limits = d.get("limits") or {}
+    regime_cfg = cfg_toml.get("regime") or {}
+    limits_cfg = cfg_toml.get("limits") or {}
+
+    raw = (
+            regime_cfg.get("regime_below_action")
+            or regime_cfg.get("regime-below-action")
+            or "HOLD"
+    )
+    act = str(raw).strip().upper()
+    if act not in ("HOLD", "SELL"):
+        act = "HOLD"
 
     return BTConfig(
-        tickers_file     = _coalesce(a.tickers,           d.get("tickers_file"),   "aktien_oop/sp500_tickers.txt"),
-        sector_meta      = _coalesce(a.sector_meta,       d.get("sector_meta"),    None),
-        save_dir         = _coalesce(a.save_dir,          d.get("save_dir"),       "aktien_oop"),
+        tickers_file     = _coalesce(a.tickers,           cfg_toml.get("tickers_file"),   "aktien_oop/sp500_tickers.txt"),
+        sector_meta      = _coalesce(a.sector_meta,       cfg_toml.get("sector_meta"),    None),
+        save_dir         = _coalesce(a.save_dir,          cfg_toml.get("save_dir"),       "aktien_oop"),
 
-        start            = _coalesce(a.start,             d.get("start"),          "2018-01-01"),
-        end              = _coalesce(a.end,               d.get("end"),            "2025-08-16"),
-        frequency        = _coalesce(a.frequency,         d.get("frequency"),      "monthly"),
+        start            = _coalesce(a.start,             cfg_toml.get("start"),          "2018-01-01"),
+        end              = _coalesce(a.end,               cfg_toml.get("end"),            "2025-08-16"),
+        frequency        = _coalesce(a.frequency,         cfg_toml.get("frequency"),      "monthly"),
 
-        as_of=_coalesce(a.start, d.get("as_of"), None),
+        # as_of=_coalesce(a.start, cfg_toml.get("as_of"), None),
+        as_of=_coalesce(getattr(a, "as_of", None), cfg_toml.get("as_of"), None),
 
-        top_k            = _coalesce(a.top_k,             d.get("top_k"),          8),
-        buffer_k         = _coalesce(a.buffer_k,          d.get("buffer_k"),       2),
-        max_per_sector   = _coalesce(a.max_per_sector,    d.get("max_per_sector"), None),
-        cost_bps         = _coalesce(a.cost_bps,          d.get("cost_bps"),       10.0),
-        slippage_bps     = _coalesce(a.slippage_bps,      d.get("slippage_bps"),   5.0),
-        min_history_days = _coalesce(a.min_history_days,  d.get("min_history_days"), 260),
+        top_k            = _coalesce(a.top_k,             cfg_toml.get("top_k"),          8),
+        buffer_k         = _coalesce(a.buffer_k,          cfg_toml.get("buffer_k"),       2),
+        max_per_sector   = _coalesce(a.max_per_sector,    cfg_toml.get("max_per_sector"), None),
+        cost_bps         = _coalesce(a.cost_bps,          cfg_toml.get("cost_bps"),       10.0),
+        slippage_bps     = _coalesce(a.slippage_bps,      cfg_toml.get("slippage_bps"),   5.0),
+        min_history_days = _coalesce(a.min_history_days,  cfg_toml.get("min_history_days"), 260),
 
-        use_equal_weight=_coalesce(a.use_equal_weight if a.use_equal_weight else None, d.get("use_equal_weight"), False),
-        friction_eps=_coalesce(a.friction_eps, d.get("friction_eps"), 0.0),
+        use_equal_weight=_coalesce(a.use_equal_weight if a.use_equal_weight else None, cfg_toml.get("use_equal_weight"), False),
+        friction_eps=_coalesce(a.friction_eps, cfg_toml.get("friction_eps"), 0.0),
         friction_eps_pct=_coalesce(
             getattr(a, "friction_eps_pct", None),
-            d.get("friction_eps_pct"),
+            cfg_toml.get("friction_eps_pct"),
             0.0
         ),
-        weight_round_step=_coalesce(getattr(a, "weight_round_step", None), d.get("weight_round_step"), 0.0),
-        max_turnover_cap=_coalesce(getattr(a, "max_turnover_cap", None), d.get("max_turnover_cap"), 0.0),
-        rebalance_every_n=_coalesce(getattr(a, "rebalance_every_n", None), d.get("rebalance_every_n"), 1),
+        weight_round_step=_coalesce(
+            getattr(a, "weight_round_step", None),
+            (limits_cfg.get("weight_round_step") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "weight_round_step", None)),
+            cfg_toml.get("weight_round_step"), 0.0),
+        max_turnover_cap=_coalesce(getattr(a, "max_turnover_cap", None), cfg_toml.get("max_turnover_cap"), 0.0),
+        rebalance_every_n=_coalesce(getattr(a, "rebalance_every_n", None), cfg_toml.get("rebalance_every_n"), 1),
         # --- Normalize benchmark keys from CLI/TOML (accept - and _ variants) ---
         benchmark=bm_primary,
         benchmark_ticker=bm_primary,  # (nur setzen, wenn das Feld in BTConfig existiert)
@@ -1660,70 +1679,62 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         dump_decision_bundles=bool(dump_bundles),
         decisions_dir=str(dec_dir),
 
-        min_position_weight=_coalesce(getattr(a, "min_position_weight", None), d.get("min_position_weight"), 0.0),
+        min_position_weight=_coalesce(
+            getattr(a, "min_position_weight", None),
+            (limits_cfg.get("min_position_weight") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "min_position_weight", None)),
+            cfg_toml.get("min_position_weight"), 0.0),
+
         max_active_names=_coalesce(
             getattr(a, "max_active_names", None),
-            d.get("max_active_names", d.get("names_limit")),
+            cfg_toml.get("max_active_names", cfg_toml.get("names_limit")),
             0
         ),
 
         # NEU: Fenster-Werte aus [windows] oder Root
         score_days=_coalesce(getattr(a, "score_days", None),
-                             d.get("score_days"),
+                             win_score_days,
+                             cfg_toml.get("score_days"),
                              252),
         vol_days=_coalesce(getattr(a, "vol_days", None),
-                           d.get("vol_days"),
+                           win_vol_days,
+                           cfg_toml.get("vol_days"),
                            63),
 
         # Regime
-        require_above_sma=_coalesce(getattr(regime, "require_above_sma", None), regime.get("require_above_sma"), False),
-        regime_use_filter=_coalesce(
-            (a.regime_use_filter if getattr(a, "regime_use_filter", False) else None),
-            d.get("regime_use_filter"),
-            False
-        ),
-        regime_below_action = _coalesce(
-            getattr(regime, "regime_below_action", None),
-            regime.get("regime_below_action"),
-            "HOLD"
-        ),
+        require_above_sma=_coalesce(getattr(regime_cfg, "require_above_sma", None), regime_cfg.get("require_above_sma"), False),
+        regime_below_action=act,
         regime_sma_days=_coalesce(
-            getattr(regime, "regime_sma_days", None),
-            regime.get("regime_sma_days"),
+            getattr(regime_cfg, "regime_sma_days", None),
+            regime_cfg.get("regime_sma_days"),
             200
         ),
         regime_exposure_low=_coalesce(
             getattr(a, "regime_exposure_low", None),
-            d.get("regime_exposure_low"),
+            cfg_toml.get("regime_exposure_low"),
             0.50
         ),
 
         # Vol-Targeting
         vol_target_ann=_coalesce(
             getattr(a, "vol_target_ann", None),
-            d.get("vol_target_ann"),
+            cfg_toml.get("vol_target_ann"),
             None
         ),
         vol_lookback_days=_coalesce(
             getattr(a, "vol_lookback_days", None),
-            d.get("vol_lookback_days"),
+            cfg_toml.get("vol_lookback_days"),
             20
         ),
         include_cash=_coalesce(
-            (limits.include_cash if getattr(limits, "include_cash", False) else None),
-            limits.get("include_cash"),
+            getattr(a, "include_cash", None),
+            (limits_cfg.get("include_cash") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "include_cash", None)),
+            cfg_toml.get("include_cash"),
             False
         ),
-        # include_cash=_coalesce(limits.include_cash if limits.include_cash else None, limits.get("include_cash"),False),
-        # include_cash=_coalesce(
-        #     getattr(a, "include_cash", None),
-        #     d.get("include_cash"),
-        #     False
-        # ),
         cash_yield_annual=_coalesce(getattr(a, "cash_yield_annual", None),
-                                    d.get("cash_yield_annual"), 0.0),
+                                    cfg_toml.get("cash_yield_annual"), 0.0),
 
-        verbose=_coalesce(a.verbose if a.verbose else None, d.get("verbose"), False),
+        verbose=_coalesce(a.verbose if a.verbose else None, cfg_toml.get("verbose"), False),
     )
 
 
@@ -1749,7 +1760,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--slippage-bps", type=float)
     ap.add_argument("--min-history-days", type=int)
 
-    ap.add_argument("--use-equal-weight", action="store_true")
+    ap.add_argument("--use-equal-weight", action="store_true", default=None)
     ap.add_argument("--friction-eps", type=float)
     ap.add_argument("--friction-eps-pct", type=float)
     ap.add_argument("--weight-round-step", type=float)
@@ -1758,7 +1769,7 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--benchmark", type=str)
     ap.add_argument("--benchmark-ticker", type=str)  # Alias
-    ap.add_argument("--dual-benchmark", action="store_true")
+    ap.add_argument("--dual-benchmark", action="store_true", default=None)
     ap.add_argument("--benchmark2", type=str)
 
     ap.add_argument("--regime-use-filter", action="store_true")
@@ -1768,13 +1779,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vol-target-ann", type=float)  # None = aus
     ap.add_argument("--vol-lookback-days", type=int)
 
-    ap.add_argument("--include-cash", action="store_true")
+    ap.add_argument("--include-cash", action="store_true", default=None)
     ap.add_argument("--cash-yield-annual", type=float)
 
     ap.add_argument("--dump-decisions", action="store_true", default=None)
     ap.add_argument("--decisions-dir", type=str)
 
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--verbose", action="store_true", default=None)
     return ap.parse_args()
 
 

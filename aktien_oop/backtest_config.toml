@@ -57,9 +57,9 @@ verbose        = false
 use_equal_weight  = false   # statt inverse-Vol
 friction_eps      = 0.0    # 0.0015  .... 1 Prozentpunkt Gewichtsdiff als Schwelle
 friction_eps_pct = 0.00
-weight_round_step  = 0.0        # 0.01 ... Zielgewichte auf 2 %-Punkt runden
+weight_round_step  = 0.01        # 0.01 ... Zielgewichte auf 2 %-Punkt runden
 max_turnover_cap = 1.0   # 0.40 ... pro Termin max. 50 % umschichten (weiches Cap)
-min_position_weight = 0.0   # 0.01 .... 1 %-Punkt
+min_position_weight = 0.01   # 0.01 .... 1 %-Punkt
 
 # --- Regime & VolTarget ---
 regime_use_filter   = false  # true .....

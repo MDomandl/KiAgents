@@ -112,17 +112,38 @@ class Runner:
     # --- Decision-Bundle Helpers ---
     @staticmethod
     def _weights_from_positions(df: pd.DataFrame) -> dict[str, float]:
-        if df is None or df.empty: return {}
-        d = {}
+        if df is None or df.empty:
+            return {}
+
+        d: dict[str, float] = {}
         for _, r in df.iterrows():
-            t = str(r.get("ticker"));
-            ap = r.get("allocation_pct")
-            if t and ap is not None:
+            t = str(r.get("ticker") or "").strip()
+            if not t:
+                continue
+
+            # Prefer true weights if present (0..1)
+            w = r.get("weight", None)
+            if w is not None:
                 try:
-                    d[t] = float(ap) / 100.0
-                except:
+                    v = float(w)
+                    if v > 0:
+                        d[t] = v
+                    continue
+                except Exception:
                     pass
-        return {k: v for k, v in d.items() if v > 0}
+
+            # Fallback for older files: allocation_pct (0..100)
+            ap = r.get("allocation_pct", None)
+            if ap is not None:
+                try:
+                    v = float(ap) / 100.0
+                    if v > 0:
+                        d[t] = v
+                except Exception:
+                    pass
+
+        # Final clean
+        return {k: v for k, v in d.items() if v > 0.0}
 
     def _write_decision_bundle(self, as_of_raw, old_w, new_w, *, regime=None, turnover_raw=None, turnover_eff=None, first_run_no_prev_state=False) -> None:
 
@@ -390,9 +411,6 @@ class Runner:
                 setattr(obj, "as_of", as_of_ts)
 
         norm = self._normalize_cfg(as_of_str=as_of_str)
-        _assign_attr(cfg, "regime_below_action", str((cfg.__getattribute__("regime"))["regime_below_action"]))
-        _assign_attr(cfg, "require_above_sma", bool((cfg.__getattribute__("regime"))["require_above_sma"]))
-        _assign_attr(cfg, "regime_sma_days", int((cfg.__getattribute__("regime"))["regime_sma_days"]))
         _assign_attr(cfg, "include_cash", bool((cfg.__getattribute__("regime"))["include_cash"]))
         # Relevante Felder zurück ins cfg spiegeln, damit Logs/Store konsistent sind
         _assign_attr(cfg, "score_days", int(norm["score_days"]))
@@ -628,10 +646,10 @@ class Runner:
                           list(probe3.columns),
                           probe3.tail(1).to_dict(orient="records"))
 
-        # === 'sel' DataFrame aus den Ergebnissen bauen (für deine Logs/Output) ===
+        # === 'sel' DataFrame aus den Ergebnissen bauen (für Logs/Output) ===
         sel_ticks = list(weights.keys())
-        sel = pd.DataFrame({"ticker": sel_ticks})
-
+        sel = pd.DataFrame({"ticker": list(weights.keys())})
+        sel["weight"] = sel["ticker"].map(lambda t: float(weights.get(t, 0.0)))
         if isinstance(scores, (pd.Series, dict)):
             sel["score"] = sel["ticker"].map(lambda t: float(scores.get(t, np.nan)))
             sel["rank"] = sel["score"].rank(ascending=False, method="first").astype("Int64")
@@ -640,34 +658,23 @@ class Runner:
             # bei HOLD/SELL ist rank nicht wirklich relevant -> 1 als Fallback oder NaN
             sel["rank"] = 1
 
-        # Allocation in Prozent (weights sind 0..1)
-        w_pct = {t: 100.0 * float(w) for t, w in weights.items()}
-        sel["allocation_pct"] = sel["ticker"].map(lambda t: round(w_pct.get(t, 0.0), 2))
+        # Anzeige: Prozent
+        sel["allocation_pct"] = (sel["weight"] * 100.0).round(2)
 
-        # Optional: Rundungsschritt wie zuvor
-        step = float(getattr(self.cfg, "weight_round_step", 0.0) or 0.0)
-        if step > 0:
-            sel["allocation_pct"] = (sel["allocation_pct"] / step).round() * step
-            s = float(sel["allocation_pct"].sum())
-            if s > 0:
-                sel["allocation_pct"] = sel["allocation_pct"] * (100.0 / s)
-
-        # As-of Spalte für deine Logs
+        # As-of Spalte Logs
         sel.insert(0, "as_of", as_of_str)
 
         # Sektoren für Ansicht
         if sector_map:
             sel["sector"] = sel["ticker"].map(sector_map).fillna("Unknown")
 
-        # Ausgabe wie gehabt
+        # Ausgabe
         want = ["as_of", "ticker"]
         if "sector" in sel.columns: want.append("sector")
         want += ["rank", "score", "allocation_pct"]
         print("\nNeues Portfolio (Turnover-Puffer aktiv):\n")
         print(sel[want])
 
-        # Für die Folge-Logs (unten) brauchst du auch 'df' nicht mehr;
-        # wir setzen num_pass auf len(sel)
         df = sel.copy()
         # ===== /Gemeinsame Kernberechnung =====
 
@@ -678,7 +685,7 @@ class Runner:
             old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
 
             # neue Gewichte (aus aktueller Auswahl)
-            new_w = self._weights_from_positions(sel)
+            new_w = {str(k): float(v) for k, v in weights.items() if float(v) > 0.0}
 
             # --- LOCKSTEP: RUN-Parameter/Universe-Check ---
 

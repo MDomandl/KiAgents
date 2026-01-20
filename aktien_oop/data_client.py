@@ -197,6 +197,9 @@ class DataClient:
 
         return last_close > last_sma
 
+    # NOTE:
+    # This is the single authoritative regime decision logic.
+    # Do NOT duplicate this elsewhere (BT / utils / runner).
     def regime_decision(self, cfg, as_of: str) -> dict:
         require = bool(getattr(cfg, "require_above_sma", False))
 

@@ -124,6 +124,10 @@ class Config:
     use_equal_weight: bool = False
     weight_round_step: float = 0.0
 
+    require_above_sma: bool = False
+    regime_below_action: str = "HOLD"
+    regime_sma_days: int = 200  # z.B. 200 Kalendertage
+
     show_plots: bool = False
     # Decision Bundles (für Comparator / Runner)
     dump_decision_bundles: bool = True
@@ -197,6 +201,19 @@ class Config:
         reb_cfg = cfg_toml.get("rebalance", {}) or {}
         topk_cfg = cfg_toml.get("topk", {}) or {}
         regime_cfg = cfg_toml.get("regime", {}) or {}
+
+        # --- Regime: kanonische Keys direkt im cfg nutzen ---
+        # Legacy alias (falls früher regime_use_filter verwendet wurde)
+        if "regime_use_filter" in regime_cfg and "require_above_sma" not in regime_cfg:
+            regime_cfg["require_above_sma"] = bool(regime_cfg.get("regime_use_filter"))
+
+        require_above_sma = bool(regime_cfg.get("require_above_sma", cfg_toml.get("require_above_sma", False)))
+        regime_sma_days = int(regime_cfg.get("regime_sma_days", cfg_toml.get("regime_sma_days", 200)) or 200)
+
+        _act = str(regime_cfg.get("regime_below_action", cfg_toml.get("regime_below_action", "HOLD")) or "HOLD").upper()
+        if _act not in ("HOLD", "SELL"):
+            _act = "HOLD"
+        regime_below_action = _act
 
         # flaches Dict für „einfache“ Keys (Top-Level + core + limits etc.)
         d: dict = dict(cfg_toml)
@@ -276,6 +293,10 @@ class Config:
                 reb_cfg.get("frequency", d.get("rebalance_frequency", d.get("rebalance"))),
                 cls.rebalance_frequency,
             ),
+
+            require_above_sma=require_above_sma,
+            regime_sma_days=regime_sma_days,
+            regime_below_action=regime_below_action,
 
             use_equal_weight=_coalesce(args.use_equal_weight,
                                        d.get("use_equal_weight"),
