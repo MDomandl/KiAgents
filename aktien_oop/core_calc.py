@@ -37,6 +37,7 @@ class CalcParams:
     slippage_bps: float = 0.0
     rebalance: str = "monthly"
     max_lookback_days: int  = None
+    max_active_names: int = 8
 
     dump_scores: bool = False
     dump_tag: str = ""
@@ -581,5 +582,51 @@ def calculate_portfolio(
 
     # einfache Equal-Weights (falls du Caps/Rundung willst: in size_weights spiegeln)
     weights = size_weights(names, p)
+
+    # --- NEW: max_active_names (post-sizing, cash-aware) ---
+    max_names = int(getattr(p, "max_active_names", 0) or 0)
+    if max_names > 0:
+        # CASH nicht mitzählen, Top-N nach Gewicht behalten
+        cash = float(weights.get("CASH", 0.0)) if "CASH" in weights else 0.0
+        items = [(k, float(v)) for k, v in weights.items() if k != "CASH" and float(v) > 0.0]
+
+        if len(items) > max_names:
+            items.sort(key=lambda kv: kv[1], reverse=True)
+            kept = dict(items[:max_names])
+
+            # Renorm auf (1 - cash)
+            s = sum(kept.values())
+            if s > 0:
+                scale = (1.0 - cash) / s
+                kept = {k: v * scale for k, v in kept.items()}
+            if cash > 0.0:
+                kept["CASH"] = cash
+
+            weights = kept
+    # --- /NEW ---
     return weights, scores
 
+def _apply_max_active_names(weights: dict[str, float], max_active_names: int) -> dict[str, float]:
+    if not weights:
+        return {}
+
+    n = int(max_active_names or 0)
+    if n <= 0:
+        return weights
+
+    # CASH nicht mitzählen
+    cash = float(weights.get("CASH", 0.0)) if "CASH" in weights else None
+    items = [(k, float(v)) for k, v in weights.items() if k != "CASH" and float(v) > 0.0]
+
+    if len(items) <= n:
+        return weights
+
+    # Top-N nach Gewicht behalten
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    kept = dict(items[:n])
+
+    # CASH wieder hinzufügen (unverändert) – Renorm macht ggf. später ein anderer Schritt
+    if cash is not None and cash > 0.0:
+        kept["CASH"] = cash
+
+    return kept

@@ -135,6 +135,7 @@ class Config:
     decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
     as_of: str = ""
     max_lookback_days: int = 360  # Sicherheits-Puffer, falls as_of genutzt wird
+    max_active_names: int = 8
 
     @property
     def force(self) -> bool:
@@ -258,6 +259,9 @@ class Config:
         if "max_lookback_days" in lim_cfg:
             d.setdefault("max_lookback_days", lim_cfg["max_lookback_days"])
 
+        if "max_active_names" in lim_cfg:
+            d.setdefault("max_active_names", lim_cfg["max_active_names"])
+
         # windows (kann der Runner später direkt aus win_cfg lesen)
         if "score_days" in win_cfg:
             d.setdefault("score_days", win_cfg["score_days"])
@@ -315,6 +319,9 @@ class Config:
             as_of=as_of,
             period=period,
             max_lookback_days=max_lookback_days,
+            max_active_names=_coalesce(args.max_active_names,
+                                     d.get("max_active_names"),
+                                     cls.max_active_names),
 
             dump_decision_bundles=_bool_merge(args.dump_decision_bundles,
                                               "dump_decision_bundles",
@@ -395,6 +402,7 @@ def parse_args() -> Config:
                    help="Globales Limit je Sektor; <=0 deaktiviert.")
     p.add_argument("--sector-limit", action="append", default=[],
                    help='Wiederholbar, Format "Sektor=Anzahl" (z. B. --sector-limit "Industrials=1")')
+    p.add_argument("--max-active-names", dest="max_active_names", type=int)
 
     a = p.parse_args()
     sector_limits = _parse_sector_limits(a.sector_limit)
@@ -416,6 +424,7 @@ def parse_args() -> Config:
         tickers_file=Path(a.tickers) if a.tickers is not None else defaults.tickers_file,
         lib_debug=a.lib_debug or defaults.lib_debug,
         show_plots=a.show_plots or defaults.show_plots,
+        max_active_names=a.max_active_names or defaults.max_active_names,
 
         # 🔽 Defaults bleiben, bis CLI explizit überschreibt
         sector_meta_file=Path(a.sector_meta) if a.sector_meta is not None else defaults.sector_meta_file,

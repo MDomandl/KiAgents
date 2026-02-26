@@ -37,6 +37,7 @@ frequency  = "monthly"
 use_sector_limits = true
 max_per_sector = 3
 gap_filter = 0.0   # 0.12 ..... normal
+max_active_names = 9
 
 # Filter so wie im BT/Helper gedacht
 days_win = 130

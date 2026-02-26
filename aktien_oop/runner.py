@@ -75,6 +75,7 @@ class RunCfgNormalized:
     # Sektor-Limits
     use_sector_limits: bool
     max_per_sector: int | None
+    max_active_names: int
 
     # Cash / Reibung / Rundung
     eps: float               # absolute Friction (z.B. 0.0)
@@ -314,6 +315,7 @@ class Runner:
         max_per_sector = _sec_get(lim_cfg, "max_per_sector", getattr(cfg, "max_per_sector", 3))
         raw_gap = _sec_get(lim_cfg, "gap_filter", None)
         gap_filter = float(0.12 if raw_gap is None else raw_gap)
+        max_active_names = _sec_get(lim_cfg, "max_active_names", getattr(cfg, "max_active_names", 8))
 
         # Rebalance-Frequenz
         rebalance_frequency = _sec_get(reb_cfg, "frequency", getattr(cfg, "rebalance_frequency", "monthly"))
@@ -327,6 +329,7 @@ class Runner:
             max_per_sector=max_per_sector,
             gap_filter=gap_filter,
             rebalance=rebalance_frequency,
+            max_active_names=max_active_names,
         )
 
     def _build_params(self, norm: dict) -> "CalcParams":
@@ -362,6 +365,7 @@ class Runner:
             ),
             top_k=int(cfg.top_k),
             buffer_k=int(cfg.buffer_k),
+            max_active_names=int(getattr(self.cfg, "max_active_names", 0) or 0),
 
             # === Finalisierung / Sizing ===
             include_cash=bool(getattr(cfg, "include_cash", False)),
@@ -423,6 +427,8 @@ class Runner:
         _assign_attr(cfg, "period", norm["period"])
         if norm["as_of"] is not None:
             _assign_attr(cfg, "as_of", norm["as_of"])
+
+        _assign_attr(cfg, "max_active_names", int(norm["max_active_names"]))
 
         logging.debug(
             "CFG(normalized/TOML): period=%s as_of=%s top_k=%s buffer_k=%s "
