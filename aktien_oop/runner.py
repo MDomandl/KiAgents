@@ -332,6 +332,28 @@ class Runner:
             max_active_names=max_active_names,
         )
 
+    def _apply_norm_to_cfg(self, norm: dict, *, as_of_str: str) -> None:
+        cfg = self.cfg
+
+        def _assign_attr(obj, name, value):
+            try:
+                object.__setattr__(obj, name, value)
+            except Exception:
+                setattr(obj, name, value)
+
+        _assign_attr(cfg, "score_days", int(norm["score_days"]))
+        _assign_attr(cfg, "vol_days", int(norm["vol_days"]))
+        _assign_attr(cfg, "use_sector_limits", bool(norm["use_sector_limits"]))
+        _assign_attr(cfg, "max_per_sector", int(norm["max_per_sector"]) if norm["max_per_sector"] is not None else None)
+        _assign_attr(cfg, "rebalance_frequency", norm["rebalance"])
+        _assign_attr(cfg, "period", norm["period"])
+        _assign_attr(cfg, "max_active_names",
+                     int(norm["max_active_names"]) if norm["max_active_names"] is not None else 0)
+
+        # as_of nur setzen, wenn vorhanden
+        if norm.get("as_of") is not None:
+            _assign_attr(cfg, "as_of", norm["as_of"])
+
     def _build_params(self, norm: dict) -> "CalcParams":
         """
         Baut CalcParams ausschließlich aus norm + cfg.
@@ -415,20 +437,7 @@ class Runner:
                 setattr(obj, "as_of", as_of_ts)
 
         norm = self._normalize_cfg(as_of_str=as_of_str)
-        _assign_attr(cfg, "include_cash", bool((cfg.__getattribute__("regime"))["include_cash"]))
-        # Relevante Felder zurück ins cfg spiegeln, damit Logs/Store konsistent sind
-        _assign_attr(cfg, "score_days", int(norm["score_days"]))
-        _assign_attr(cfg, "vol_days", int(norm["vol_days"]))
-        _assign_attr(cfg, "use_sector_limits", bool(norm["use_sector_limits"]))
-        _assign_attr(cfg, "max_per_sector", (
-            int(norm["max_per_sector"]) if norm["max_per_sector"] is not None else None
-        ))
-        _assign_attr(cfg, "rebalance_frequency", norm["rebalance"])
-        _assign_attr(cfg, "period", norm["period"])
-        if norm["as_of"] is not None:
-            _assign_attr(cfg, "as_of", norm["as_of"])
-
-        _assign_attr(cfg, "max_active_names", int(norm["max_active_names"]))
+        self._apply_norm_to_cfg(norm, as_of_str=as_of_str)
 
         logging.debug(
             "CFG(normalized/TOML): period=%s as_of=%s top_k=%s buffer_k=%s "
@@ -520,9 +529,6 @@ class Runner:
 
         # === CalcParams aus normalisierter cfg ===
         cfg = self.cfg  # Kurzalias
-
-        # --- 1) Normalize cfg (ohne cfg zu mutieren) ---
-        norm = self._normalize_cfg(as_of_str=as_of_str)
 
         logging.debug(
             "CFG(normalized): period=%s as_of=%s top_k=%s buffer_k=%s score_days=%s vol_days=%s "
@@ -626,9 +632,10 @@ class Runner:
 
         # auch die finalen Gewichte dumpen
         if isinstance(weights, dict):
-            df_w = pd.DataFrame(
-                [{"ticker": k, "weight": v} for k, v in weights.items()]
-            ).sort_values("weight", ascending=False)
+            rows = [{"ticker": str(k), "weight": float(v)} for k, v in weights.items()]
+            df_w = pd.DataFrame(rows, columns=["ticker", "weight"])
+            if not df_w.empty:
+                df_w = df_w.sort_values("weight", ascending=False)
             df_w.to_csv(debug_dir / f"RUN_weights_{safe_as_of}.csv", index=False)
 
         logging.debug(

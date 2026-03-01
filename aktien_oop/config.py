@@ -190,6 +190,7 @@ class Config:
         ap.add_argument("--period", type=str, default=None,
                         help="Fallback-Period (z. B. 400d), wenn --as-of nicht gesetzt ist")
         ap.add_argument("--max-lookback-days", dest="max_lookback_days", type=int)
+        ap.add_argument("--max_active_names", dest="max_active_names", type=int)
 
         args = ap.parse_args()
 

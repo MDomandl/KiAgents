@@ -504,6 +504,13 @@ def _period_to_days(period) -> int:
         m = re.search(r"\d+", str(period))
         return int(m.group(0)) if m else 252
 
+def _calc_turnover(old_w: dict[str, float], new_w: dict[str, float]) -> float:
+    old = pd.Series(old_w, dtype=float)
+    new = pd.Series(new_w, dtype=float)
+    aligned = pd.concat([old, new], axis=1).fillna(0.0)
+    aligned.columns = ["old", "new"]
+    return float((aligned["old"] - aligned["new"]).abs().sum() / 2.0)
+
 # ---------------------------------------
 # Backtester
 # ---------------------------------------
@@ -733,18 +740,18 @@ class Backtester:
         sma200_all = prices_all.rolling(200, min_periods=1).mean()
         sma100_all = prices_all.rolling(100, min_periods=1).mean()  # falls du 100d brauchst
 
-        # 2.6) valid_cols ableiten (genug Historie + nicht nur NaN)
+        # 2.6) valid_cols_preload ableiten (genug Historie + nicht nur NaN)
         min_hist_days = 252  # anpassen, falls du eine andere Mindesthistorie willst
         have_hist = (prices_all.notna().rolling(min_hist_days, min_periods=min_hist_days).sum().iloc[
                          -1] >= min_hist_days)
-        valid_cols = [c for c in prices_all.columns if bool(have_hist.get(c, False))]
+        valid_cols_preload = [c for c in prices_all.columns if bool(have_hist.get(c, False))]
 
-        # 2.7) Alles auf valid_cols „trimmen“ (Konsistenz)
-        prices_all = prices_all[valid_cols]
-        rets_all = rets_all[valid_cols]
-        sma200_all = sma200_all[valid_cols]
-        sma100_all = sma100_all[valid_cols]
-        secmap = {t: secmap_pre.get(t, "UNKNOWN") for t in valid_cols}  # <- ab hier 'secmap' verfügbar
+        # 2.7) Alles auf valid_cols_preload „trimmen“ (Konsistenz)
+        prices_all = prices_all[valid_cols_preload]
+        rets_all = rets_all[valid_cols_preload]
+        sma200_all = sma200_all[valid_cols_preload]
+        sma100_all = sma100_all[valid_cols_preload]
+        secmap = {t: secmap_pre.get(t, "UNKNOWN") for t in valid_cols_preload}  # <- ab hier 'secmap' verfügbar
         # === /PREPARE ===
 
         # 3) Backtest-Schleife
@@ -865,19 +872,19 @@ class Backtester:
                 continue
 
             # Universum mit genügend Historie
-            valid_cols = []
+            valid_cols_asof = []
             for t in px.columns:
                 seg = px.loc[:d, t].dropna()
                 if len(seg) >= self.cfg.min_history_days:
-                    valid_cols.append(t)
-            if not valid_cols:
+                    valid_cols_asof.append(t)
+            if not valid_cols_asof:
                 continue
 
             # Scoring + Filter
             # === Rebalance via Core (einheitlicher Pfad) ===
 
             # 1) Universe & Snapshots
-            universe = list(valid_cols)  # valid_cols kommt direkt oberhalb aus deinem Preload
+            universe = list(valid_cols_asof)  # valid_cols_asof kommt direkt oberhalb aus deinem Preload
             # 1) Universe & Snapshots (STATEFUL für echten Backtest)
             _old_weights_snapshot = (
                 cur_weights.to_dict()
@@ -987,11 +994,7 @@ class Backtester:
             # <<< DEBUG-DUMP ENDE
 
             # 5) Turnover/Cost EINMAL (alt vs. neu) — vor cur_weights-Update!
-            _old = pd.Series(_old_weights_snapshot, dtype=float)
-            _new = pd.Series(new_w_dict, dtype=float)
-            aligned = pd.concat([_old, _new], axis=1).fillna(0.0)
-            aligned.columns = ["old", "new"]
-            raw_turnover = float((aligned["old"] - aligned["new"]).abs().sum() / 2.0)
+            raw_turnover = _calc_turnover(_old_weights_snapshot, new_w_dict)
 
             _cap = float(self.cfg.max_turnover_cap or 0.0)
             turnover_eff = min(raw_turnover, _cap) if _cap > 0.0 else raw_turnover
