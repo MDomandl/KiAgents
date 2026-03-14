@@ -171,7 +171,7 @@ def select_topk_buffer(
             if sec is None or str(sec).strip().upper() in ("", "UNKNOWN", "N/A", "NA", "NONE"):
                 picked.append(t)
                 if len(picked) >= top_k:
-                    return picked if len(picked) >= top_k else picked
+                    return picked
             else:
                 if _sector_ok(per_sec, sec, p):
                     picked.append(t)

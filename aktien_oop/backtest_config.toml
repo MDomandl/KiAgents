@@ -40,7 +40,6 @@ frequency      = "monthly"   # "monthly" oder "weekly"
 [limits]
 use_sector_limits = true
 max_per_sector = 3           # 0 oder negativ = deaktiviert
-
 max_active_names    = 9     # 8 .... oder 15, wenn du etwas „Luft“ willst
 
 # --- Kostenmodell (Basispunkte) ---

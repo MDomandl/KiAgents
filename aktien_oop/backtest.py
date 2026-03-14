@@ -498,7 +498,10 @@ def apply_exposures_and_cash(
 def _period_to_days(period) -> int:
     """'800d'/'252' → int Tage (robust)."""
     try:
-        return int(pd.to_timedelta(str(period)) / pd.Timedelta(days=1))
+        value = str(period).strip()
+        if value.endswith("d"):
+            value = value[:-1] + "D"
+        return int(pd.to_timedelta(value) / pd.Timedelta(days=1))
     except Exception:
         import re
         m = re.search(r"\d+", str(period))
@@ -720,7 +723,7 @@ class Backtester:
         # 2.3) Preload-Fenster bestimmen
         asof0 = pd.Timestamp(rdates[0])
         asofN = pd.Timestamp(rdates[-1])
-        _days = max(800, _period_to_days(getattr(self.cfg, "period", "800d")))
+        _days = max(800, _period_to_days(getattr(self.cfg, "period", "800D")))
         bt_start = (asof0 - pd.Timedelta(days=_days)).normalize()
         bt_end = asofN
 
@@ -928,7 +931,7 @@ class Backtester:
 
             cp = CalcParams(
                 as_of=_asof_str,
-                period=getattr(self.cfg, "period", "800d"),
+                period=getattr(self.cfg, "period", "800D"),
                 adjusted=bool(adjusted),
                 score_days=int(score_days),
                 vol_days=int(vol_days),
@@ -945,6 +948,7 @@ class Backtester:
                 max_per_sector=int(self.cfg.max_per_sector),
                 top_k=int(self.cfg.top_k),
                 buffer_k=int(self.cfg.buffer_k),
+                max_active_names=int(getattr(self.cfg, "max_active_names", 0) or 0),
 
                 # Finalisierung
                 include_cash=bool(getattr(self.cfg, "include_cash", False)),
@@ -1689,9 +1693,8 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
 
         max_active_names=_coalesce(
             getattr(a, "max_active_names", None),
-            cfg_toml.get("max_active_names", cfg_toml.get("names_limit")),
-            0
-        ),
+            (limits_cfg.get("max_active_names") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "max_active_names", None)),
+            cfg_toml.get("max_active_names", cfg_toml.get("names_limit")), 0),
 
         # NEU: Fenster-Werte aus [windows] oder Root
         score_days=_coalesce(getattr(a, "score_days", None),
