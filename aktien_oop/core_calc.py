@@ -40,6 +40,7 @@ class CalcParams:
     max_active_names: int = 8
 
     dump_scores: bool = False
+    dump_selection: bool = False
     dump_tag: str = ""
 
 # Signaturen für die Injektionsfunktionen
@@ -465,6 +466,64 @@ def dump_scores(scores, as_of_str, tag):
     df.to_csv(path)
 
 
+def _build_selection_dump(scores: pd.Series, keep: pd.Index, names: Sequence[str], sectors: Dict[str, str], p: CalcParams, prev_holdings: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    prev_list = [str(t) for t in (prev_holdings or [])]
+    prev_set = set(prev_list)
+    selected_set = {str(t) for t in names}
+
+    ranked = scores.reindex(keep).dropna()
+    ranked = (
+        pd.DataFrame({"ticker": ranked.index.astype(str), "score": ranked.astype(float).values})
+        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
+    )
+
+    selection_df = ranked.copy()
+    selection_df["rank"] = range(1, len(selection_df) + 1)
+    selection_df["sector"] = selection_df["ticker"].map(lambda t: sectors.get(t, "UNKNOWN"))
+    selection_df["selected"] = selection_df["ticker"].isin(selected_set)
+
+    top_k = int(getattr(p, "top_k", 0) or 0)
+    buffer_k = max(int(getattr(p, "buffer_k", 0) or 0), 0)
+    cutoff = top_k + buffer_k
+
+    reasons: list[str] = []
+    for row in selection_df.itertuples(index=False):
+        ticker = str(row.ticker)
+        rank = int(row.rank)
+        selected = bool(row.selected)
+        is_prev = ticker in prev_set
+
+        if selected and is_prev and rank <= cutoff:
+            reasons.append("buffer")
+        elif selected and rank <= top_k:
+            reasons.append("top_k")
+        elif selected:
+            reasons.append("selected")
+        elif is_prev and rank <= cutoff:
+            reasons.append("buffer_limit")
+        elif rank <= top_k:
+            reasons.append("limit")
+        elif is_prev:
+            reasons.append("buffer_miss")
+        else:
+            reasons.append("not_selected")
+
+    selection_df["reason"] = reasons
+    return selection_df.loc[:, ["ticker", "rank", "score", "sector", "selected", "reason"]]
+
+
+def _dump_selection(scores: pd.Series, keep: pd.Index, names: Sequence[str], sectors: Dict[str, str], p: CalcParams, prev_holdings: Optional[Iterable[str]] = None) -> None:
+    dump_dir = Path("aktien_oop/dumps")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    as_of = str(p.as_of)[:10]
+    tag = getattr(p, "dump_tag", "X")
+    out_sel = dump_dir / f"selection_{tag}_{as_of}.csv"
+
+    selection_df = _build_selection_dump(scores, keep, names, sectors, p, prev_holdings=prev_holdings)
+    selection_df.to_csv(out_sel, index=False)
+
+
 def calculate_portfolio(
     universe: Sequence[str],
     p: CalcParams,
@@ -548,37 +607,8 @@ def calculate_portfolio(
         names = select_topk_buffer(scores, keep, sectors, p, prev_holdings=prev_holdings)
     else:
         names = select_topk(scores, keep, sectors, p)
-    if getattr(p, "dump_scores", False):
-        dump_dir = Path("aktien_oop/dumps")
-        dump_dir.mkdir(parents=True, exist_ok=True)
-
-        as_of = str(p.as_of)[:10]
-        tag = getattr(p, "dump_tag", "X")
-
-        # 1) Score-Dump (wie bisher)
-        out_scores = dump_dir / f"scores_{tag}_{as_of}.csv"
-        s = scores.dropna().sort_values(ascending=False)
-        pd.DataFrame({"ticker": s.index, "score": s.values}).to_csv(out_scores, index=False)
-
-        # 2) Selection-Dump (NEU)
-        selected_set = set(names)
-        keep_set = set(keep)
-
-        df_sel = pd.DataFrame({
-            "ticker": scores.index.astype(str),
-            "score": scores.values,
-        })
-        df_sel["keep"] = df_sel["ticker"].isin(keep_set)
-        df_sel["sector"] = df_sel["ticker"].map(lambda t: sectors.get(t, "UNKNOWN"))
-        df_sel["selected"] = df_sel["ticker"].isin(selected_set)
-
-        # rank nur für sinnvolle Zeilen
-        df_sel = df_sel[df_sel["keep"]].copy()
-        df_sel = df_sel.sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
-        df_sel["rank"] = range(1, len(df_sel) + 1)
-
-        out_sel = dump_dir / f"selection_{tag}_{as_of}.csv"
-        df_sel.to_csv(out_sel, index=False)
+    if getattr(p, "dump_selection", False):
+        _dump_selection(scores, keep, names, sectors, p, prev_holdings=prev_holdings)
 
     # einfache Equal-Weights (falls du Caps/Rundung willst: in size_weights spiegeln)
     weights = size_weights(names, p)

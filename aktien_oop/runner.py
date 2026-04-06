@@ -403,6 +403,7 @@ class Runner:
             max_lookback_days=getattr(cfg, "max_lookback_days", None),
 
             dump_scores=True,
+            dump_selection=bool(getattr(cfg, "dump_selection", False)),
             dump_tag="RUN",
         )
 

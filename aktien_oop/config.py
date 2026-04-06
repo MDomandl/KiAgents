@@ -131,6 +131,7 @@ class Config:
     show_plots: bool = False
     # Decision Bundles (für Comparator / Runner)
     dump_decision_bundles: bool = True
+    dump_selection: bool = False
     decisions_dir: Path = PKG_ROOT / "decisions"
     decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
     as_of: str = ""
@@ -182,6 +183,8 @@ class Config:
         # Decision-Bundles
         ap.add_argument("--dump-decisions", dest="dump_decision_bundles", action="store_true", default=None)
         ap.add_argument("--no-dump-decisions", dest="dump_decision_bundles", action="store_false", default=None)
+        ap.add_argument("--dump-selection", dest="dump_selection", action="store_true", default=None)
+        ap.add_argument("--no-dump-selection", dest="dump_selection", action="store_false", default=None)
         ap.add_argument("--decisions-dir", dest="decisions_dir", type=str)
         ap.add_argument("--prefix", dest="prefix", type=str)
 

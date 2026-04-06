@@ -90,6 +90,7 @@ class BTConfig:
     cash_yield_annual: float = 0.0
 
     dump_decision_bundles: bool = False
+    dump_selection: bool = False
     decisions_dir: str = "aktien_oop/decisions"
 
     # NEU: Fenster-Konfiguration
@@ -958,6 +959,7 @@ class Backtester:
                 friction_eps_pct=float(getattr(self.cfg, "friction_eps_pct", 0.0)),
 
                 dump_scores=True,
+                dump_selection=bool(getattr(self.cfg, "dump_selection", False)),
                 dump_tag="BT",
             )
 
@@ -1263,7 +1265,7 @@ class Backtester:
 
         print(f"Total Return: {total_return:7.2%}   |  CAGR: {cagr:7.2%}")
         print(f"Volatility:   {vol_ann:6.2%} |  Sharpe(0%): {sharpe:4.2f}")
-        print(f"Max DD:       {mdd:7.2%}   [{dd_start.date()} → {dd_end.date()}]")
+        print(f"Max DD:       {mdd:7.2%}   [{dd_start.date()} -> {dd_end.date()}]")
         print(f"Avg Turnover: {avg_turnover:6.2%} |  Avg Cost: {avg_cost:6.4f}")
 
         # CSVs (ggf. erneut/erstmalig) schreiben – einheitlich inkl. run_id
@@ -1388,7 +1390,7 @@ class Backtester:
         summary_lines = [
             f"Total Return: {total_return:7.2%}   |  CAGR: {cagr:7.2%}",
             f"Volatility:   {vol_ann:6.2%} |  Sharpe(0%): {sharpe:4.2f}",
-            f"Max DD:       {mdd:7.2%}   [{dd_start.date()} → {dd_end.date()}]",
+            f"Max DD:       {mdd:7.2%}   [{dd_start.date()} -> {dd_end.date()}]",
             f"Avg Turnover: {avg_turnover:6.2%} |  Avg Cost: {avg_cost:6.4f}",
             "",
             f"Benchmark:     {bm_ticker}",
@@ -1627,6 +1629,12 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         cfg_toml.get("dump-decisions"),
         False,
     )
+    dump_selection = _first_not_none(
+        getattr(a, "dump_selection", None),
+        cfg_toml.get("dump_selection"),
+        cfg_toml.get("dump-selection"),
+        False,
+    )
     dec_dir = _first_not_none(
         getattr(a, "decisions_dir", None),
         cfg_toml.get("decisions_dir"),
@@ -1684,6 +1692,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         dual_benchmark=bool(bm_dual),
         benchmark2=bm_secondary,
         dump_decision_bundles=bool(dump_bundles),
+        dump_selection=bool(dump_selection),
         decisions_dir=str(dec_dir),
 
         min_position_weight=_coalesce(

@@ -16,6 +16,7 @@ tickers_file = "aktien_oop/sp500_tickers.txt"
 sector_meta = "aktien_oop/sp500_meta.csv"
 
 dump_scores = true
+dump_selection = false
 dump_tag = "RUN"
 
 [core]
