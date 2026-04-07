@@ -13,7 +13,8 @@ as_of  = "2025-10-08"
 
 # --- Decision Bundles ---
 dump_decision_bundles = true
-dump_selection = false
+dump_selection = true
+dump_weights = true
 decisions_dir = "aktien_oop/decisions"
 decision_prefix = "BT"
 

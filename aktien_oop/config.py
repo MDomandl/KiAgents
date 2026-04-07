@@ -132,6 +132,7 @@ class Config:
     # Decision Bundles (für Comparator / Runner)
     dump_decision_bundles: bool = True
     dump_selection: bool = False
+    dump_weights: bool = False
     decisions_dir: Path = PKG_ROOT / "decisions"
     decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
     as_of: str = ""
@@ -185,6 +186,8 @@ class Config:
         ap.add_argument("--no-dump-decisions", dest="dump_decision_bundles", action="store_false", default=None)
         ap.add_argument("--dump-selection", dest="dump_selection", action="store_true", default=None)
         ap.add_argument("--no-dump-selection", dest="dump_selection", action="store_false", default=None)
+        ap.add_argument("--dump-weights", dest="dump_weights", action="store_true", default=None)
+        ap.add_argument("--no-dump-weights", dest="dump_weights", action="store_false", default=None)
         ap.add_argument("--decisions-dir", dest="decisions_dir", type=str)
         ap.add_argument("--prefix", dest="prefix", type=str)
 
@@ -330,6 +333,12 @@ class Config:
             dump_decision_bundles=_bool_merge(args.dump_decision_bundles,
                                               "dump_decision_bundles",
                                               cls.dump_decision_bundles),
+            dump_selection=_bool_merge(args.dump_selection,
+                                       "dump_selection",
+                                       cls.dump_selection),
+            dump_weights=_bool_merge(args.dump_weights,
+                                     "dump_weights",
+                                     cls.dump_weights),
             decisions_dir=Path(_coalesce(args.decisions_dir,
                                          d.get("decisions_dir"),
                                          cls.decisions_dir)),

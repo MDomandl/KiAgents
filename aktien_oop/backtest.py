@@ -91,6 +91,7 @@ class BTConfig:
 
     dump_decision_bundles: bool = False
     dump_selection: bool = False
+    dump_weights: bool = False
     decisions_dir: str = "aktien_oop/decisions"
 
     # NEU: Fenster-Konfiguration
@@ -960,6 +961,7 @@ class Backtester:
 
                 dump_scores=True,
                 dump_selection=bool(getattr(self.cfg, "dump_selection", False)),
+                dump_weights=bool(getattr(self.cfg, "dump_weights", False)),
                 dump_tag="BT",
             )
 
@@ -1635,6 +1637,12 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         cfg_toml.get("dump-selection"),
         False,
     )
+    dump_weights = _first_not_none(
+        getattr(a, "dump_weights", None),
+        cfg_toml.get("dump_weights"),
+        cfg_toml.get("dump-weights"),
+        False,
+    )
     dec_dir = _first_not_none(
         getattr(a, "decisions_dir", None),
         cfg_toml.get("decisions_dir"),
@@ -1693,6 +1701,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         benchmark2=bm_secondary,
         dump_decision_bundles=bool(dump_bundles),
         dump_selection=bool(dump_selection),
+        dump_weights=bool(dump_weights),
         decisions_dir=str(dec_dir),
 
         min_position_weight=_coalesce(

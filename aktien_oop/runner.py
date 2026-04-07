@@ -404,6 +404,7 @@ class Runner:
 
             dump_scores=True,
             dump_selection=bool(getattr(cfg, "dump_selection", False)),
+            dump_weights=bool(getattr(cfg, "dump_weights", False)),
             dump_tag="RUN",
         )
 

@@ -41,6 +41,7 @@ class CalcParams:
 
     dump_scores: bool = False
     dump_selection: bool = False
+    dump_weights: bool = False
     dump_tag: str = ""
 
 # Signaturen für die Injektionsfunktionen
@@ -524,6 +525,37 @@ def _dump_selection(scores: pd.Series, keep: pd.Index, names: Sequence[str], sec
     selection_df.to_csv(out_sel, index=False)
 
 
+def _dump_weights(weight_raw: Dict[str, float], weight_after_round: Dict[str, float], weight_final: Dict[str, float], p: CalcParams) -> None:
+    dump_dir = Path("aktien_oop/dumps")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    as_of = str(p.as_of)[:10]
+    tag = getattr(p, "dump_tag", "X")
+    out_weights = dump_dir / f"weights_{tag}_{as_of}.csv"
+
+    tickers = sorted(
+        {str(t) for t in weight_raw}
+        | {str(t) for t in weight_after_round}
+        | {str(t) for t in weight_final}
+    )
+    cash_weight = float(weight_final.get("CASH", 0.0)) if isinstance(weight_final, dict) else 0.0
+
+    rows = []
+    for ticker in tickers:
+        rows.append({
+            "ticker": ticker,
+            "weight_raw": float(weight_raw.get(ticker, 0.0)),
+            "weight_after_round": float(weight_after_round.get(ticker, 0.0)),
+            "weight_final": float(weight_final.get(ticker, 0.0)),
+            "cash_weight": cash_weight,
+        })
+
+    pd.DataFrame(
+        rows,
+        columns=["ticker", "weight_raw", "weight_after_round", "weight_final", "cash_weight"],
+    ).to_csv(out_weights, index=False)
+
+
 def calculate_portfolio(
     universe: Sequence[str],
     p: CalcParams,
@@ -611,7 +643,9 @@ def calculate_portfolio(
         _dump_selection(scores, keep, names, sectors, p, prev_holdings=prev_holdings)
 
     # einfache Equal-Weights (falls du Caps/Rundung willst: in size_weights spiegeln)
-    weights = size_weights(names, p)
+    weights_raw = size_weights(names, p)
+    weights_after_round = dict(weights_raw)
+    weights = dict(weights_after_round)
 
     # --- NEW: max_active_names (post-sizing, cash-aware) ---
     max_names = int(getattr(p, "max_active_names", 0) or 0)
@@ -633,6 +667,9 @@ def calculate_portfolio(
                 kept["CASH"] = cash
 
             weights = kept
+
+    if getattr(p, "dump_weights", False):
+        _dump_weights(weights_raw, weights_after_round, weights, p)
     # --- /NEW ---
     return weights, scores
 
