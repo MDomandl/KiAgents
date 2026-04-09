@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import hashlib
 from pathlib import Path
-from aktien_oop.core_calc import CalcParams, calculate_portfolio, slice_to_window
+from aktien_oop.core_calc import CalcParams, calculate_portfolio, slice_to_window, _rank_desc_stable
 
 import logging
 import json
@@ -629,7 +629,7 @@ class Runner:
         if isinstance(scores, pd.Series):
             df_scores = scores.to_frame(name="score_adj")
             df_scores.index.name = "ticker"
-            df_scores = df_scores.reset_index().sort_values("score_adj", ascending=False)
+            df_scores = df_scores.reset_index().sort_values(["score_adj", "ticker"], ascending=[False, True], kind="mergesort")
             df_scores.to_csv(debug_dir / f"RUN_scores_{safe_as_of}.csv", index=False)
 
         # auch die finalen Gewichte dumpen
@@ -667,7 +667,9 @@ class Runner:
         sel["weight"] = sel["ticker"].map(lambda t: float(weights.get(t, 0.0)))
         if isinstance(scores, (pd.Series, dict)):
             sel["score"] = sel["ticker"].map(lambda t: float(scores.get(t, np.nan)))
-            sel["rank"] = sel["score"].rank(ascending=False, method="first").astype("Int64")
+            rank_input = pd.Series(sel["score"].to_numpy(), index=sel["ticker"].astype(str).to_numpy(), dtype=float)
+            stable_ranks = _rank_desc_stable(rank_input)
+            sel["rank"] = sel["ticker"].map(lambda t: int(stable_ranks[str(t)])).astype("Int64")
         else:
             sel["score"] = np.nan
             # bei HOLD/SELL ist rank nicht wirklich relevant -> 1 als Fallback oder NaN

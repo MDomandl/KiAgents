@@ -48,9 +48,36 @@ class CalcParams:
 GetPricesFn  = Callable[[Sequence[str], str, str, bool], pd.DataFrame]
 GetSectorsFn = Callable[[Sequence[str]], Dict[str, str]]
 
+def _sort_score_frame(scores: pd.Series) -> pd.DataFrame:
+    return (
+        pd.DataFrame({"ticker": scores.index.astype(str), "score": scores.astype(float).values})
+        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def _sort_scores_desc_ticker(scores: pd.Series) -> pd.Series:
+    sorted_df = _sort_score_frame(scores.dropna())
+    return pd.Series(
+        sorted_df["score"].to_numpy(),
+        index=sorted_df["ticker"].to_numpy(),
+        dtype=float,
+    )
+
+
+def _rank_desc_stable(scores: pd.Series) -> pd.Series:
+    sorted_scores = _sort_scores_desc_ticker(scores)
+    ranked = pd.Series(
+        range(1, len(sorted_scores) + 1),
+        index=sorted_scores.index,
+        dtype=int,
+    )
+    return ranked.reindex(scores.index).astype(int)
+
+
 def _rank_desc(scores: pd.Series) -> pd.Series:
-    """Ränge 1..N (1 = bester Score) – stabil wie im BT."""
-    return scores.rank(ascending=False, method="first").astype(int)
+    """R?nge 1..N (1 = bester Score) mit deterministischem Tie-Breaker via Ticker."""
+    return _rank_desc_stable(scores)
 
 def _period_to_days(period: str | None) -> int:
     if period is None:
@@ -143,13 +170,7 @@ def select_topk_buffer(
     s0 = scores.reindex(keep).dropna()
 
     # Deterministische Sortierung: score desc, ticker asc
-    cand = (
-        pd.DataFrame({"ticker": s0.index.astype(str), "score": s0.values})
-        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
-    )
-
-    # wieder Series wie zuvor
-    s = pd.Series(cand["score"].to_numpy(), index=cand["ticker"].to_numpy(), dtype=float)
+    s = _sort_scores_desc_ticker(pd.Series(s0.values, index=s0.index.astype(str), dtype=float))
 
     if s.empty:
         return []
@@ -401,13 +422,7 @@ def select_topk(scores: pd.Series, keep: pd.Index,
     s0 = scores.reindex(keep).dropna()
 
     # Deterministische Sortierung: score desc, ticker asc
-    cand = (
-        pd.DataFrame({"ticker": s0.index.astype(str), "score": s0.values})
-        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
-    )
-
-    # wieder Series wie zuvor
-    s = pd.Series(cand["score"].to_numpy(), index=cand["ticker"].to_numpy(), dtype=float)
+    s = _sort_scores_desc_ticker(pd.Series(s0.values, index=s0.index.astype(str), dtype=float))
 
     if not p.use_sector_limits or not p.max_per_sector:
         return list(s.index[:p.top_k])
@@ -455,12 +470,8 @@ def _safe_reindex_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 def dump_scores(scores, as_of_str, tag):
     Path("aktien_oop/decisions").mkdir(parents=True, exist_ok=True)
 
-    df = (
-        scores
-        .dropna()
-        .sort_values(ascending=False)
-        .to_frame(name=as_of_str)
-    )
+    sorted_scores = _sort_scores_desc_ticker(scores)
+    df = sorted_scores.to_frame(name=as_of_str)
     df.index.name = "ticker"
 
     path = f"aktien_oop/decisions/scores_{tag}_{as_of_str}.csv"
@@ -472,11 +483,7 @@ def _build_selection_dump(scores: pd.Series, keep: pd.Index, names: Sequence[str
     prev_set = set(prev_list)
     selected_set = {str(t) for t in names}
 
-    ranked = scores.reindex(keep).dropna()
-    ranked = (
-        pd.DataFrame({"ticker": ranked.index.astype(str), "score": ranked.astype(float).values})
-        .sort_values(["score", "ticker"], ascending=[False, True], kind="mergesort")
-    )
+    ranked = _sort_score_frame(pd.Series(scores.reindex(keep).dropna().values, index=scores.reindex(keep).dropna().index.astype(str), dtype=float))
 
     selection_df = ranked.copy()
     selection_df["rank"] = range(1, len(selection_df) + 1)
@@ -486,31 +493,76 @@ def _build_selection_dump(scores: pd.Series, keep: pd.Index, names: Sequence[str
     top_k = int(getattr(p, "top_k", 0) or 0)
     buffer_k = max(int(getattr(p, "buffer_k", 0) or 0), 0)
     cutoff = top_k + buffer_k
+    ranks = {str(row.ticker): int(row.rank) for row in selection_df.itertuples(index=False)}
 
-    reasons: list[str] = []
+    reasons: dict[str, str] = {}
+    picked: list[str] = []
+    per_sec: Dict[str, int] = {}
+
+    def _mark_reason(ticker: str, reason: str) -> None:
+        if ticker not in reasons:
+            reasons[ticker] = reason
+
+    for ticker in prev_list:
+        if ticker not in ranks:
+            continue
+        rank = ranks[ticker]
+        if rank > cutoff:
+            _mark_reason(ticker, "cutoff")
+            continue
+
+        sec = _norm_sector(sectors.get(ticker))
+        if sec is not None and not _sector_ok(per_sec, sec, p):
+            _mark_reason(ticker, "sector_limit")
+            continue
+
+        if len(picked) >= top_k:
+            _mark_reason(ticker, "cutoff")
+            continue
+
+        picked.append(ticker)
+        if sec is not None:
+            per_sec[sec] = per_sec.get(sec, 0) + 1
+        _mark_reason(ticker, "buffer")
+
     for row in selection_df.itertuples(index=False):
         ticker = str(row.ticker)
         rank = int(row.rank)
-        selected = bool(row.selected)
-        is_prev = ticker in prev_set
+        if ticker in picked:
+            continue
 
-        if selected and is_prev and rank <= cutoff:
-            reasons.append("buffer")
-        elif selected and rank <= top_k:
-            reasons.append("top_k")
-        elif selected:
-            reasons.append("selected")
-        elif is_prev and rank <= cutoff:
-            reasons.append("buffer_limit")
-        elif rank <= top_k:
-            reasons.append("limit")
-        elif is_prev:
-            reasons.append("buffer_miss")
-        else:
-            reasons.append("not_selected")
+        sec = _norm_sector(sectors.get(ticker))
+        if sec is not None and not _sector_ok(per_sec, sec, p):
+            _mark_reason(ticker, "sector_limit")
+            continue
 
-    selection_df["reason"] = reasons
-    return selection_df.loc[:, ["ticker", "rank", "score", "sector", "selected", "reason"]]
+        if len(picked) >= top_k:
+            _mark_reason(ticker, "cutoff")
+            continue
+
+        picked.append(ticker)
+        if sec is not None:
+            per_sec[sec] = per_sec.get(sec, 0) + 1
+        _mark_reason(ticker, "top_k" if rank <= top_k else "selected")
+
+    selection_df["cutoff_rank"] = cutoff
+    selection_df["within_cutoff"] = selection_df["rank"] <= cutoff
+    selection_df["within_top_20"] = selection_df["rank"] <= 20
+    selection_df["is_prev_holding"] = selection_df["ticker"].isin(prev_set)
+    selection_df["reason"] = selection_df["ticker"].map(lambda ticker: reasons.get(str(ticker), "cutoff"))
+
+    return selection_df.loc[:, [
+        "ticker",
+        "score",
+        "rank",
+        "cutoff_rank",
+        "within_cutoff",
+        "within_top_20",
+        "is_prev_holding",
+        "sector",
+        "selected",
+        "reason",
+    ]]
 
 
 def _dump_selection(scores: pd.Series, keep: pd.Index, names: Sequence[str], sectors: Dict[str, str], p: CalcParams, prev_holdings: Optional[Iterable[str]] = None) -> None:
@@ -629,7 +681,7 @@ def calculate_portfolio(
 
         out = dump_dir / f"scores_{tag}_{as_of}.csv"
 
-        s = scores.dropna().sort_values(ascending=False)
+        s = _sort_scores_desc_ticker(scores)
         df = pd.DataFrame({"ticker": s.index, "score": s.values})
         df.to_csv(out, index=False)
 

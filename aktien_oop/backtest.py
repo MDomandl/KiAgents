@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
-from aktien_oop.core_calc import CalcParams, calculate_portfolio
+from aktien_oop.core_calc import CalcParams, calculate_portfolio, _rank_desc_stable
 from aktien_oop.data_client import DataClient
 from .config import Config
 
@@ -395,7 +395,7 @@ def score_universe(feat: Dict[str, pd.DataFrame],
     })
     penalty = 0.15 * df["under_sma"].astype(int)  # 0.15 = 15%-Punkte Rank-Penalty
     df["score_adj"] = df["score"] - penalty
-    df = df.sort_values("score_adj", ascending=False)
+    df = df.sort_values(["score_adj", "ticker"], ascending=[False, True], kind="mergesort")
     df["rank"] = np.arange(1, len(df) + 1, dtype=int)
     return df
 
@@ -1041,7 +1041,8 @@ class Backtester:
                 # Dicts robust bauen
                 if _scores is not None:
                     scores_dict = _scores.round(6).to_dict()
-                    ranks_dict = _scores.rank(method="first", ascending=False).astype(int).to_dict()
+                    _scores.index = _scores.index.astype(str)
+                    ranks_dict = _rank_desc_stable(_scores).to_dict()
                 else:
                     scores_dict = {t: float("nan") for t in cur_holdings}
                     ranks_dict = {t: int(1) for t in cur_holdings}  # Fallback
