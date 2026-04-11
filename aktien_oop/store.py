@@ -58,6 +58,7 @@ class PortfolioStore:
             raise ValueError("positions must include a 'ticker' column")
 
         df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce").dt.normalize()
+        df = df.dropna(subset=["as_of", "ticker"])
         df["ticker"] = df["ticker"].astype(str)
 
         if self.positions_path.exists():
@@ -75,7 +76,6 @@ class PortfolioStore:
         else:
             combined = df
 
-        combined = combined.dropna(subset=["as_of", "ticker"])
         combined = combined.drop_duplicates(subset=["as_of", "ticker"], keep="last")
         combined = combined.sort_values(["as_of", "ticker"], kind="mergesort").reset_index(drop=True)
         combined.to_csv(self.positions_path, index=False)
