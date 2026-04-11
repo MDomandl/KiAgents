@@ -38,6 +38,8 @@ class PortfolioStore:
 
         prev_asof = df_prev["as_of"].max()
         snap = df_prev[df_prev["as_of"] == prev_asof].copy()
+        if "ticker" in snap.columns:
+            snap = snap.sort_values("ticker", kind="mergesort").reset_index(drop=True)
         return snap
 
     def load_positions(self) -> pd.DataFrame:
@@ -52,7 +54,31 @@ class PortfolioStore:
         df = df.copy()
         if "as_of" not in df.columns:
             df.insert(0, "as_of", pd.Timestamp.now())
-        df.to_csv(self.positions_path, index=False)
+        if "ticker" not in df.columns:
+            raise ValueError("positions must include a 'ticker' column")
+
+        df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce").dt.normalize()
+        df["ticker"] = df["ticker"].astype(str)
+
+        if self.positions_path.exists():
+            existing = pd.read_csv(self.positions_path)
+            if not existing.empty:
+                if "as_of" not in existing.columns or "ticker" not in existing.columns:
+                    logging.warning("positions.csv schema is missing 'as_of' or 'ticker' - replacing with current snapshot.")
+                    combined = df
+                else:
+                    existing["as_of"] = pd.to_datetime(existing["as_of"], errors="coerce").dt.normalize()
+                    existing["ticker"] = existing["ticker"].astype(str)
+                    combined = pd.concat([existing, df], ignore_index=True, sort=False)
+            else:
+                combined = df
+        else:
+            combined = df
+
+        combined = combined.dropna(subset=["as_of", "ticker"])
+        combined = combined.drop_duplicates(subset=["as_of", "ticker"], keep="last")
+        combined = combined.sort_values(["as_of", "ticker"], kind="mergesort").reset_index(drop=True)
+        combined.to_csv(self.positions_path, index=False)
 
     def last_rebalance_time(self):
         """Jüngsten Timestamp aus runs_log oder positions ermitteln (robust)."""
