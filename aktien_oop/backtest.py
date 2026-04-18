@@ -58,6 +58,7 @@ class BTConfig:
 
     top_k: int
     buffer_k: int
+    use_sector_limits: bool
     max_per_sector: Optional[int]   # None = aus
     cost_bps: float                 # Transaktionskosten (bps) pro Turnover
     slippage_bps: float             # Slippage (bps) pro Turnover
@@ -576,9 +577,7 @@ class Backtester:
         buffer_k = getattr(cfg, "buffer_k", None) or getattr(getattr(cfg, "topk", object()), "buffer_k", None) or 3
         mps = getattr(cfg, "max_per_sector", None) or getattr(getattr(cfg, "limits", object()), "max_per_sector",
                                                               None) or 3
-        use_sl = getattr(cfg, "use_sector_limits", None)
-        if use_sl is None:
-            use_sl = bool(mps and int(mps) > 0)
+        use_sl = bool(getattr(cfg, "use_sector_limits", True))
 
         # Fenster direkt aus BTConfig (kann über [windows] oder Root kommen)
         score_days = int(getattr(cfg, "score_days", 252) or 252)
@@ -586,9 +585,7 @@ class Backtester:
         max_per_sector = _first(_get(cfg, "max_per_sector"),
                                 _get(limits, "max_per_sector"),
                                 None)
-        use_sector_limits = bool(_first(_get(cfg, "use_sector_limits"),
-                                        (max_per_sector is not None and int(max_per_sector) > 0),
-                                        False))
+        use_sector_limits = bool(_get(cfg, "use_sector_limits", True))
 
 
 
@@ -1677,7 +1674,18 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
 
         top_k            = _coalesce(a.top_k,             cfg_toml.get("top_k"),          8),
         buffer_k         = _coalesce(a.buffer_k,          cfg_toml.get("buffer_k"),       2),
-        max_per_sector   = _coalesce(a.max_per_sector,    cfg_toml.get("max_per_sector"), None),
+        use_sector_limits=bool(_coalesce(
+            getattr(a, "use_sector_limits", None),
+            (limits_cfg.get("use_sector_limits") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "use_sector_limits", None)),
+            cfg_toml.get("use_sector_limits"),
+            True,
+        )),
+        max_per_sector   = _coalesce(
+            a.max_per_sector,
+            (limits_cfg.get("max_per_sector") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "max_per_sector", None)),
+            cfg_toml.get("max_per_sector"),
+            None,
+        ),
         cost_bps         = _coalesce(a.cost_bps,          cfg_toml.get("cost_bps"),       10.0),
         slippage_bps     = _coalesce(a.slippage_bps,      cfg_toml.get("slippage_bps"),   5.0),
         min_history_days = _coalesce(a.min_history_days,  cfg_toml.get("min_history_days"), 260),
@@ -1780,6 +1788,8 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--top-k", type=int)
     ap.add_argument("--buffer-k", type=int)
+    ap.add_argument("--use-sector-limits", dest="use_sector_limits", action="store_true", default=None)
+    ap.add_argument("--no-sector-limits", dest="use_sector_limits", action="store_false", default=None)
     ap.add_argument("--max-per-sector", type=int)
     ap.add_argument("--cost-bps", type=float)
     ap.add_argument("--slippage-bps", type=float)
