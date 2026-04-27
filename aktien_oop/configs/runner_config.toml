@@ -3,8 +3,6 @@ extends = "strategy.toml"
 
 top_k = 12
 buffer_k = 3
-use_sector_limits = true
-max_per_sector = 3
 adjusted = true
 
 # Logging & Bundles
@@ -21,7 +19,7 @@ dump_weights = true
 dump_tag = "RUN"
 
 [core]
-period = "801d"
+period = "800d"
 as_of = "2025-04-30"
 
 [windows]
@@ -38,7 +36,7 @@ frequency  = "monthly"
 [limits]
 use_sector_limits = true
 max_per_sector = 3
-gap_filter = 0.0   # 0.12 ..... normal
+gap_filter = 0.12   # 0.12 ..... normal
 max_active_names = 9
 
 # Filter so wie im BT/Helper gedacht
@@ -51,6 +49,12 @@ min_price  = 0.0
 min_volume = 0.0
 
 # Gewichtung & Reibung exakt wie im BT (falls du magst)
+#friction_eps:
+#- Status: verdrahtet
+#- Wirkung: vorhanden (intermediate)
+#- Einfluss auf finale Gewichte: keiner (aktuell)
+#- Grund: wird durch Renormalisierung/Equal Weight neutralisiert
+#- Priorität: niedrig / später überdenken
 friction_eps       = 0.0015
 friction_eps_pct   = 0.00
 weight_round_step  = 0.01

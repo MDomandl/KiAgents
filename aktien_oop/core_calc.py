@@ -447,6 +447,31 @@ def size_weights(names: Sequence[str], p: CalcParams) -> Dict[str, float]:
     # TODO: Falls BT Caps/Rundung/Turnover-Logik in der Finalisierung nutzt, hier spiegeln.
     return weights
 
+
+def _apply_friction_eps(
+    weights: Dict[str, float],
+    prev_weights: Optional[Dict[str, float]],
+    p: CalcParams,
+) -> Dict[str, float]:
+    eps = float(getattr(p, "friction_eps", 0.0) or 0.0)
+    if eps <= 0.0 or not prev_weights:
+        return dict(weights)
+
+    merged: Dict[str, float] = {}
+    keys = {str(k) for k in weights} | {str(k) for k in prev_weights}
+    for ticker in sorted(keys):
+        old_weight = float(prev_weights.get(ticker, 0.0))
+        new_weight = float(weights.get(ticker, 0.0))
+        kept_weight = old_weight if abs(new_weight - old_weight) < eps else new_weight
+        if kept_weight > 0.0:
+            merged[ticker] = kept_weight
+
+    total = float(sum(merged.values()))
+    if total <= 0.0:
+        return {}
+
+    return {ticker: float(weight / total) for ticker, weight in merged.items()}
+
 def _to_series(weights) -> pd.Series:
     """Erzwingt eine float-Series aus dict/Series, ohne Indexverluste."""
     if isinstance(weights, pd.Series):
@@ -614,6 +639,7 @@ def calculate_portfolio(
     get_prices: GetPricesFn,
     get_sectors: GetSectorsFn,
     prev_holdings: Optional[Iterable[str]] = None,   # <— NEU
+    prev_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict[str, float], pd.Series]:
     """
     Ein-Schuss-Berechnung für EIN as_of.
@@ -719,6 +745,8 @@ def calculate_portfolio(
                 kept["CASH"] = cash
 
             weights = kept
+
+    weights = _apply_friction_eps(weights, prev_weights, p)
 
     if getattr(p, "dump_weights", False):
         _dump_weights(weights_raw, weights_after_round, weights, p)

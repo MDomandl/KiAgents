@@ -117,11 +117,14 @@ class Config:
     adv_min_dollars: float = 5_000_000
     top_k: int = 10   # Anzahl Aktien im Portfolio
     buffer_k: int = 4  # Turnover-Puffer
+    use_sector_limits: bool = True
+    gap_filter: float = 0.0
     force_rebalance: bool = False # via CLI überschreibbar
     rebalance_frequency: str = "weekly"  # "monthly" oder "weekly"
     verbose: bool = False # via CLI überschreibbar
     lib_debug: bool = False
     use_equal_weight: bool = False
+    friction_eps: float = 0.0
     weight_round_step: float = 0.0
 
     require_above_sma: bool = False
@@ -133,6 +136,7 @@ class Config:
     dump_decision_bundles: bool = True
     dump_selection: bool = False
     dump_weights: bool = False
+    dump_friction_debug: bool = False
     decisions_dir: Path = PKG_ROOT / "decisions"
     decision_prefix: str = "RUN"  # Runner schreibt RUN_*.json
     as_of: str = ""
@@ -169,9 +173,13 @@ class Config:
 
         ap.add_argument("--top-k", dest="top_k", type=int)
         ap.add_argument("--buffer-k", dest="buffer_k", type=int)
+        ap.add_argument("--use-sector-limits", dest="use_sector_limits", action="store_true", default=None)
+        ap.add_argument("--no-sector-limits", dest="use_sector_limits", action="store_false", default=None)
+        ap.add_argument("--gap-filter", dest="gap_filter", type=float)
         ap.add_argument("--rebalance", dest="rebalance_frequency", choices=["weekly", "monthly"])
         ap.add_argument("--max-per-sector", dest="max_per_sector", type=int)
         ap.add_argument("--equal-weight", dest="use_equal_weight", action="store_true", default=None)
+        ap.add_argument("--friction-eps", dest="friction_eps", type=float)
         ap.add_argument("--weight-round-step", dest="weight_round_step", type=float)
         # Optional dict z.B. {"Energy":1,"IT":2} – zuerst weglassen, bei Bedarf parse_json ergänzen
         # ap.add_argument("--sector-limits", dest="sector_limits", type=str)
@@ -188,6 +196,8 @@ class Config:
         ap.add_argument("--no-dump-selection", dest="dump_selection", action="store_false", default=None)
         ap.add_argument("--dump-weights", dest="dump_weights", action="store_true", default=None)
         ap.add_argument("--no-dump-weights", dest="dump_weights", action="store_false", default=None)
+        ap.add_argument("--dump-friction-debug", dest="dump_friction_debug", action="store_true", default=None)
+        ap.add_argument("--no-dump-friction-debug", dest="dump_friction_debug", action="store_false", default=None)
         ap.add_argument("--decisions-dir", dest="decisions_dir", type=str)
         ap.add_argument("--prefix", dest="prefix", type=str)
 
@@ -312,6 +322,9 @@ class Config:
             use_equal_weight=_coalesce(args.use_equal_weight,
                                        d.get("use_equal_weight"),
                                        cls.use_equal_weight),
+            friction_eps=_coalesce(args.friction_eps,
+                                   d.get("friction_eps"),
+                                   cls.friction_eps),
             weight_round_step=_coalesce(args.weight_round_step,
                                         d.get("weight_round_step"),
                                         cls.weight_round_step),
@@ -319,6 +332,12 @@ class Config:
             max_per_sector=_coalesce(args.max_per_sector,
                                      d.get("max_per_sector"),
                                      cls.max_per_sector),
+            use_sector_limits=_bool_merge(args.use_sector_limits,
+                                          "use_sector_limits",
+                                          cls.use_sector_limits),
+            gap_filter=_coalesce(args.gap_filter,
+                                 d.get("gap_filter"),
+                                 cls.gap_filter),
 
             verbose=_bool_merge(args.verbose, "verbose", cls.verbose),
             lib_debug=_bool_merge(args.lib_debug, "lib_debug", cls.lib_debug),
@@ -339,6 +358,9 @@ class Config:
             dump_weights=_bool_merge(args.dump_weights,
                                      "dump_weights",
                                      cls.dump_weights),
+            dump_friction_debug=_bool_merge(args.dump_friction_debug,
+                                            "dump_friction_debug",
+                                            cls.dump_friction_debug),
             decisions_dir=Path(_coalesce(args.decisions_dir,
                                          d.get("decisions_dir"),
                                          cls.decisions_dir)),

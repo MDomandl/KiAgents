@@ -2,8 +2,6 @@ extends = "strategy.toml"
 
 top_k = 12
 buffer_k = 3
-use_sector_limits = true
-max_per_sector = 3
 adjusted = true
 
 score_days = 200
@@ -43,6 +41,7 @@ frequency      = "monthly"   # "monthly" oder "weekly"
 use_sector_limits = true
 max_per_sector = 3           # 0 oder negativ = deaktiviert
 max_active_names    = 9     # 8 .... oder 15, wenn du etwas „Luft“ willst
+gap_filter = 0.12
 
 # --- Kostenmodell (Basispunkte) ---
 cost_bps       = 0
@@ -56,10 +55,10 @@ verbose        = false
 
 # --- Gewichtung & Reibung ---
 use_equal_weight  = false   # statt inverse-Vol
-friction_eps      = 0.0    # 0.0015  .... 1 Prozentpunkt Gewichtsdiff als Schwelle
+friction_eps      = 0.1    # 0.0015  .... 1 Prozentpunkt Gewichtsdiff als Schwelle
 friction_eps_pct = 0.00
 weight_round_step  = 0.01        # 0.01 ... Zielgewichte auf 2 %-Punkt runden
-max_turnover_cap = 1.0   # 0.40 ... pro Termin max. 50 % umschichten (weiches Cap)
+max_turnover_cap = 0.4   # 0.40 ... pro Termin max. 50 % umschichten (weiches Cap)
 min_position_weight = 0.01   # 0.01 .... 1 %-Punkt
 
 # --- Regime & VolTarget ---

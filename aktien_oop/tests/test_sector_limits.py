@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
 from argparse import Namespace
 
 import pandas as pd
 
 from aktien_oop.backtest import _build_cfg_from_config_and_cli
+from aktien_oop.config import Config
 from aktien_oop.core_calc import CalcParams, select_topk_buffer
 
 
@@ -71,7 +73,6 @@ def test_backtest_config_uses_explicit_use_sector_limits_false(tmp_path):
         """
 top_k = 3
 buffer_k = 0
-max_per_sector = 1
 
 [limits]
 use_sector_limits = false
@@ -123,6 +124,31 @@ max_per_sector = 1
     )
 
     cfg = _build_cfg_from_config_and_cli(args)
+
+    assert cfg.use_sector_limits is False
+    assert cfg.max_per_sector == 1
+
+
+def test_runner_config_uses_limits_section_for_sector_limits(tmp_path):
+    config_path = tmp_path / "runner_config.toml"
+    config_path.write_text(
+        """
+top_k = 3
+buffer_k = 0
+
+[limits]
+use_sector_limits = false
+max_per_sector = 1
+""".strip(),
+        encoding="utf-8",
+    )
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = ["runner", "--config", str(config_path)]
+        cfg = Config.from_cli()
+    finally:
+        sys.argv = old_argv
 
     assert cfg.use_sector_limits is False
     assert cfg.max_per_sector == 1

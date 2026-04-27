@@ -65,6 +65,7 @@ class BTConfig:
     min_history_days: int = 260     # Mindesthistorie je Ticker
 
     use_equal_weight: bool = False
+    gap_filter: float = 0.0
     friction_eps: float = 0.0
     friction_eps_pct: float = 0.0
     weight_round_step: float = 0.0
@@ -575,28 +576,34 @@ class Backtester:
 
         top_k = getattr(cfg, "top_k", None) or getattr(getattr(cfg, "topk", object()), "top_k", None) or 12
         buffer_k = getattr(cfg, "buffer_k", None) or getattr(getattr(cfg, "topk", object()), "buffer_k", None) or 3
-        mps = getattr(cfg, "max_per_sector", None) or getattr(getattr(cfg, "limits", object()), "max_per_sector",
-                                                              None) or 3
-        use_sl = bool(getattr(cfg, "use_sector_limits", True))
+        max_per_sector = _first(
+            _get(limits, "max_per_sector"),
+            _get(cfg, "max_per_sector"),
+            3,
+        )
+        use_sector_limits = bool(_first(
+            _get(limits, "use_sector_limits"),
+            _get(cfg, "use_sector_limits"),
+            True,
+        ))
+        gap_filter = float(_first(
+            _get(limits, "gap_filter"),
+            _get(cfg, "gap_filter"),
+            0.0,
+        ) or 0.0)
 
         # Fenster direkt aus BTConfig (kann über [windows] oder Root kommen)
         score_days = int(getattr(cfg, "score_days", 252) or 252)
         vol_days = int(getattr(cfg, "vol_days", 63) or 63)
-        max_per_sector = _first(_get(cfg, "max_per_sector"),
-                                _get(limits, "max_per_sector"),
-                                None)
-        use_sector_limits = bool(_get(cfg, "use_sector_limits", True))
-
-
-
         adjusted = getattr(cfg, "adjusted", None)
         if adjusted is None:
             adjusted = getattr(getattr(cfg, "data", object()), "adjusted", True)
 
         _assign(cfg, "top_k", int(top_k))
         _assign(cfg, "buffer_k", int(buffer_k))
-        _assign(cfg, "max_per_sector", int(mps) if mps is not None else None)
-        _assign(cfg, "use_sector_limits", bool(use_sl))
+        _assign(cfg, "max_per_sector", int(max_per_sector) if max_per_sector is not None else None)
+        _assign(cfg, "use_sector_limits", bool(use_sector_limits))
+        _assign(cfg, "gap_filter", float(gap_filter))
         _assign(cfg, "score_days", int(score_days))
         _assign(cfg, "vol_days", int(vol_days))
         _assign(cfg, "adjusted", bool(adjusted))
@@ -837,7 +844,7 @@ class Backtester:
                     print(
                         f"[LOCKSTEP][BT ] as_of={_asof_dbg} "
                         f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
-                        f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
+                        f"use_sector_limits={bool(getattr(_cfg, 'use_sector_limits', True))} "
                         f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
                         f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
                         f"universe_len={len(_univ)} sha={_univ_sha}"
@@ -938,7 +945,7 @@ class Backtester:
                 # Filter
                 use_under_sma=bool(getattr(self.cfg, "use_under_sma", False)),
                 sma_days=int(getattr(self.cfg, "sma_days", 200)),
-                gap_filter=float(getattr(self.cfg, "gap_filter", 0.0)),
+                gap_filter=float(self.cfg.gap_filter),
                 min_price=float(getattr(self.cfg, "min_price", 0.0)),
                 min_volume=float(getattr(self.cfg, "min_volume", 0.0)),
 
@@ -983,6 +990,7 @@ class Backtester:
                     _get_prices_bt,
                     _get_sectors_bt,
                     prev_holdings=prev_holdings,
+                    prev_weights=_old_weights_snapshot,
                 )
 
             self._dbg(
@@ -1204,7 +1212,7 @@ class Backtester:
                 print(
                     f"[LOCKSTEP][BT ] as_of={_asof_dbg} "
                     f"top_k={getattr(_cfg, 'top_k', None)} buffer_k={getattr(_cfg, 'buffer_k', None)} "
-                    f"use_sector_limits={(getattr(_cfg, 'max_per_sector', None) or 0) > 0} "
+                    f"use_sector_limits={bool(getattr(_cfg, 'use_sector_limits', True))} "
                     f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
                     f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
                     f"universe_len={len(_univ)} sha={_univ_sha}"
@@ -1691,7 +1699,18 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         min_history_days = _coalesce(a.min_history_days,  cfg_toml.get("min_history_days"), 260),
 
         use_equal_weight=_coalesce(a.use_equal_weight if a.use_equal_weight else None, cfg_toml.get("use_equal_weight"), False),
-        friction_eps=_coalesce(a.friction_eps, cfg_toml.get("friction_eps"), 0.0),
+        gap_filter=float(_coalesce(
+            getattr(a, "gap_filter", None),
+            (limits_cfg.get("gap_filter") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "gap_filter", None)),
+            cfg_toml.get("gap_filter"),
+            0.0,
+        ) or 0.0),
+        friction_eps=_coalesce(
+            a.friction_eps,
+            (limits_cfg.get("friction_eps") if isinstance(limits_cfg, dict) else getattr(limits_cfg, "friction_eps", None)),
+            cfg_toml.get("friction_eps"),
+            0.0,
+        ),
         friction_eps_pct=_coalesce(
             getattr(a, "friction_eps_pct", None),
             cfg_toml.get("friction_eps_pct"),
@@ -1796,6 +1815,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-history-days", type=int)
 
     ap.add_argument("--use-equal-weight", action="store_true", default=None)
+    ap.add_argument("--gap-filter", type=float)
     ap.add_argument("--friction-eps", type=float)
     ap.add_argument("--friction-eps-pct", type=float)
     ap.add_argument("--weight-round-step", type=float)

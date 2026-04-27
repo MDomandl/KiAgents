@@ -58,6 +58,75 @@ def _series_to_dict(s):
     return {str(k): float(v) for k, v in dict(s).items()}
 
 
+def _classify_friction_action(prev_weight: float, target_weight: float, friction_eps: float) -> str:
+    if friction_eps > 0.0 and abs(target_weight - prev_weight) < friction_eps:
+        return "suppressed_exact"
+    if prev_weight <= 0.0 and target_weight > 0.0:
+        return "enter_applied_exact"
+    if prev_weight > 0.0 and target_weight <= 0.0:
+        return "exit_applied_exact"
+    if abs(target_weight - prev_weight) <= 1e-12:
+        return "unchanged_exact"
+    return "reweighted_exact"
+
+
+def _write_runner_friction_debug(
+    *,
+    debug_dir: Path,
+    as_of_str: str,
+    prev_weights: dict[str, float],
+    final_weights: dict[str, float],
+    friction_eps: float,
+) -> None:
+    dump_path = Path("aktien_oop/dumps") / f"weights_RUN_{as_of_str}.csv"
+
+    target_weights: dict[str, float] = {}
+    after_friction_weights: dict[str, float] = {}
+    if dump_path.exists():
+        df_dump = pd.read_csv(dump_path)
+        for row in df_dump.to_dict(orient="records"):
+            ticker = str(row.get("ticker", "")).strip()
+            if not ticker:
+                continue
+            target_weights[ticker] = float(row.get("weight_after_round", 0.0) or 0.0)
+            after_friction_weights[ticker] = float(row.get("weight_final", 0.0) or 0.0)
+    else:
+        target_weights = {str(k): float(v) for k, v in final_weights.items()}
+        after_friction_weights = {str(k): float(v) for k, v in final_weights.items()}
+
+    tickers = sorted(set(prev_weights) | set(target_weights) | set(after_friction_weights) | set(final_weights))
+    rows = []
+    for ticker in tickers:
+        prev_weight = float(prev_weights.get(ticker, 0.0) or 0.0)
+        target_weight = float(target_weights.get(ticker, 0.0) or 0.0)
+        weight_after_friction = float(after_friction_weights.get(ticker, 0.0) or 0.0)
+        final_weight = float(final_weights.get(ticker, 0.0) or 0.0)
+        rows.append({
+            "ticker": ticker,
+            "prev_weight": prev_weight,
+            "target_weight_before_friction": target_weight,
+            "abs_delta": abs(target_weight - prev_weight),
+            "effective_friction_eps": float(friction_eps or 0.0),
+            "friction_action": _classify_friction_action(prev_weight, target_weight, float(friction_eps or 0.0)),
+            "weight_after_friction": weight_after_friction,
+            "final_weight": final_weight,
+        })
+
+    pd.DataFrame(
+        rows,
+        columns=[
+            "ticker",
+            "prev_weight",
+            "target_weight_before_friction",
+            "abs_delta",
+            "effective_friction_eps",
+            "friction_action",
+            "weight_after_friction",
+            "final_weight",
+        ],
+    ).to_csv(debug_dir / f"RUN_friction_{as_of_str}.csv", index=False)
+
+
 @dataclasses.dataclass(frozen=True)
 class RunCfgNormalized:
     # Kern-Infos
@@ -313,8 +382,8 @@ class Runner:
         # Sektor-Limits
         use_sector_limits = bool(_sec_get(lim_cfg, "use_sector_limits", getattr(cfg, "use_sector_limits", True)))
         max_per_sector = _sec_get(lim_cfg, "max_per_sector", getattr(cfg, "max_per_sector", 3))
-        raw_gap = _sec_get(lim_cfg, "gap_filter", None)
-        gap_filter = float(0.12 if raw_gap is None else raw_gap)
+        raw_gap = _sec_get(lim_cfg, "gap_filter", getattr(cfg, "gap_filter", 0.0))
+        gap_filter = float(raw_gap or 0.0)
         max_active_names = _sec_get(lim_cfg, "max_active_names", getattr(cfg, "max_active_names", 8))
 
         # Rebalance-Frequenz
@@ -404,7 +473,7 @@ class Runner:
 
             dump_scores=True,
             dump_selection=bool(getattr(cfg, "dump_selection", False)),
-            dump_weights=bool(getattr(cfg, "dump_weights", False)),
+            dump_weights=bool(getattr(cfg, "dump_weights", False) or getattr(cfg, "dump_friction_debug", False)),
             dump_tag="RUN",
         )
 
@@ -476,13 +545,14 @@ class Runner:
         logging.info("Starte Bewertung (%d Ticker)...", len(tickers))
         has_sector_meta = bool(sector_map)
         # Sichtbare Zusammenfassung der Sektor-Settings
-        limits_active = has_sector_meta and (
+        limits_active = bool(getattr(self.cfg, "use_sector_limits", True)) and has_sector_meta and (
                 (self.cfg.max_per_sector is not None and self.cfg.max_per_sector > 0)
                 or bool(self.cfg.sector_limits)
         )
 
         print(
             f"Sektor-Limits: {'AKTIV' if limits_active else 'inaktiv'} | "
+            f"use_sector_limits={getattr(self.cfg, 'use_sector_limits', True)} | "
             f"max_per_sector={self.cfg.max_per_sector} | "
             f"sector_limits={self.cfg.sector_limits or '-'} | "
             f"meta={self.cfg.sector_meta_file}"
@@ -601,7 +671,7 @@ class Runner:
         # Jetzt erst der Core-Call:
         if action == "PROCEED":
             weights, scores = calculate_portfolio(
-                tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
+                tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings, prev_weights=old_w
             )
         else:
             # HOLD / SELL -> kein Core Call
@@ -617,7 +687,7 @@ class Runner:
             else:
                 # defensiver Fallback
                 weights, scores = calculate_portfolio(
-                    tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings
+                    tickers, params, _get_prices, _get_sectors, prev_holdings=prev_holdings, prev_weights=old_w
                 )
 
         debug_dir = Path("aktien_oop/debug")
@@ -639,6 +709,15 @@ class Runner:
             if not df_w.empty:
                 df_w = df_w.sort_values("weight", ascending=False)
             df_w.to_csv(debug_dir / f"RUN_weights_{safe_as_of}.csv", index=False)
+
+            if bool(getattr(self.cfg, "dump_weights", False) or getattr(self.cfg, "dump_friction_debug", False)):
+                _write_runner_friction_debug(
+                    debug_dir=debug_dir,
+                    as_of_str=safe_as_of,
+                    prev_weights={str(k): float(v) for k, v in old_w.items()},
+                    final_weights={str(k): float(v) for k, v in weights.items()},
+                    friction_eps=float(getattr(params, "friction_eps", 0.0) or 0.0),
+                )
 
         logging.debug(
             "[DEBUG/RUN] calculate_portfolio -> %d Namen, Beispiele: %s",

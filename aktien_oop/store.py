@@ -70,6 +70,8 @@ class PortfolioStore:
                 else:
                     existing["as_of"] = pd.to_datetime(existing["as_of"], errors="coerce").dt.normalize()
                     existing["ticker"] = existing["ticker"].astype(str)
+                    snapshot_dates = set(df["as_of"].dropna())
+                    existing = existing[~existing["as_of"].isin(snapshot_dates)]
                     combined = pd.concat([existing, df], ignore_index=True, sort=False)
             else:
                 combined = df
