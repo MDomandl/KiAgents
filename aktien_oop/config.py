@@ -1,5 +1,5 @@
 # config.py
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import argparse, logging, json
 from typing import Optional
@@ -8,8 +8,11 @@ try:
 except Exception:
     tomllib = None
 
-def _coalesce(cli_val, cfg_val, default):
-    return cli_val if cli_val is not None else (cfg_val if cfg_val is not None else default)
+def _coalesce(*vals):
+    for val in vals:
+        if val is not None:
+            return val
+    return None
 
 def _deep_merge(dst: dict, src: dict) -> dict:
     for k, v in (src or {}).items():
@@ -70,6 +73,13 @@ DEFAULT_ALIASES = {"BRK.B":"BRK-B","BRK.A":"BRK-A","BF.B":"BF-B","BF.A":"BF-A","
 PKG_ROOT = Path(__file__).resolve().parent           # <— aktien_oop/
 DEFAULT_SAVE_DIR = PKG_ROOT                          # oder: PKG_ROOT / "runs"
 
+
+@dataclass(frozen=True)
+class UniverseConfig:
+    name: str = "sp500"
+    tickers_file: Path = PKG_ROOT / "sp500_tickers.txt"
+    meta_file: Path = PKG_ROOT / "sp500_meta.csv"
+
 def _load_aliases() -> dict[str,str]:
     aliases = {k.upper(): v.upper() for k,v in DEFAULT_ALIASES.items()}
     if ALIAS_FILE.exists():
@@ -107,6 +117,7 @@ def setup_logging(verbose: bool, lib_debug: bool = False, log_file: Path | None 
 class Config:
     tickers_file: Path = PKG_ROOT / "sp500_tickers.txt"
     sector_meta_file: Path = PKG_ROOT / "sp500_meta.csv" # Mapping: ticker,sector[,sub_industry]
+    universe: UniverseConfig = field(default_factory=UniverseConfig)
     save_dir: Path = DEFAULT_SAVE_DIR
 
     # Strategie-Parameter
@@ -155,6 +166,22 @@ class Config:
         # frozen=True → object.__setattr__
         object.__setattr__(self, "tickers_file", Path(self.tickers_file).resolve())
         object.__setattr__(self, "sector_meta_file", Path(self.sector_meta_file).resolve())
+        universe = self.universe
+        universe_tickers_file = Path(getattr(universe, "tickers_file", self.tickers_file))
+        universe_meta_file = Path(getattr(universe, "meta_file", self.sector_meta_file))
+        if universe_tickers_file == UniverseConfig.tickers_file:
+            universe_tickers_file = self.tickers_file
+        if universe_meta_file == UniverseConfig.meta_file:
+            universe_meta_file = self.sector_meta_file
+        object.__setattr__(
+            self,
+            "universe",
+            UniverseConfig(
+                name=str(getattr(universe, "name", "sp500") or "sp500"),
+                tickers_file=universe_tickers_file.resolve(),
+                meta_file=universe_meta_file.resolve(),
+            ),
+        )
         object.__setattr__(self, "save_dir", Path(self.save_dir).resolve())
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,6 +246,7 @@ class Config:
         reb_cfg = cfg_toml.get("rebalance", {}) or {}
         topk_cfg = cfg_toml.get("topk", {}) or {}
         regime_cfg = cfg_toml.get("regime", {}) or {}
+        universe_cfg = cfg_toml.get("universe", {}) or {}
 
         # --- Regime: kanonische Keys direkt im cfg nutzen ---
         # Legacy alias (falls früher regime_use_filter verwendet wurde)
@@ -289,6 +317,20 @@ class Config:
         period = args.period or core_cfg.get("period") or d.get("period") or cls.period
         as_of = args.as_of or core_cfg.get("as_of") or d.get("as_of")
         max_lookback_days = args.max_lookback_days or int(d.get("max_lookback_days", cls.max_lookback_days))
+        universe_name = universe_cfg.get("name", d.get("universe_name", UniverseConfig().name))
+        universe_tickers_file = _coalesce(
+            args.tickers_file,
+            universe_cfg.get("tickers_file"),
+            d.get("tickers_file"),
+            cls.tickers_file,
+        )
+        universe_meta_file = _coalesce(
+            args.sector_meta_file,
+            universe_cfg.get("meta_file"),
+            d.get("meta_file"),
+            d.get("sector_meta_file", d.get("sector_meta")),
+            cls.sector_meta_file,
+        )
 
         # Helper, um Boolean-Flags nur bei explizitem CLI-Setzen zu übernehmen:
         def _bool_merge(cli_val, cfg_key, default):
@@ -297,12 +339,13 @@ class Config:
             return bool(d.get(cfg_key, default))
 
         cfg = cls(
-            tickers_file=Path(_coalesce(args.tickers_file,
-                                        d.get("tickers_file"),
-                                        cls.tickers_file)),
-            sector_meta_file=Path(_coalesce(args.sector_meta_file,
-                                            d.get("sector_meta_file", d.get("sector_meta")),
-                                            cls.sector_meta_file)),
+            tickers_file=Path(universe_tickers_file),
+            sector_meta_file=Path(universe_meta_file),
+            universe=UniverseConfig(
+                name=str(universe_name or "sp500"),
+                tickers_file=Path(universe_tickers_file),
+                meta_file=Path(universe_meta_file),
+            ),
             save_dir=Path(_coalesce(args.save_dir,
                                     d.get("save_dir"),
                                     cls.save_dir)),
@@ -375,6 +418,7 @@ class Config:
         object.__setattr__(cfg, "limits", lim_cfg)
         object.__setattr__(cfg, "rebalance", reb_cfg)
         object.__setattr__(cfg, "regime", regime_cfg)
+        object.__setattr__(cfg, "universe_cfg", universe_cfg)
 
         # sinnvolle Fallbacks für score_days/vol_days direkt am cfg
         if "score_days" in d:
@@ -386,9 +430,11 @@ class Config:
         setup_logging(cfg.verbose, cfg.lib_debug)
         logging.debug(
             "CFG: top_k=%s buffer_k=%s rebalance=%s max_per_sector=%s "
-            "sector_limits=%s decisions_dir=%s decision_prefix=%s dump=%s",
+            "sector_limits=%s universe_name=%s universe_file=%s decisions_dir=%s decision_prefix=%s dump=%s",
             cfg.top_k, cfg.buffer_k, cfg.rebalance_frequency,
             cfg.max_per_sector, cfg.sector_limits,
+            cfg.universe.name,
+            str(cfg.universe.tickers_file),
             str(getattr(cfg, "decisions_dir", None)),
             getattr(cfg, "decision_prefix", None),
             getattr(cfg, "dump_decision_bundles", None),

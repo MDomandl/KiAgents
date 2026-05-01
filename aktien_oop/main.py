@@ -4,7 +4,7 @@ import argparse
 from .config import Config, PKG_ROOT
 from .runner import Runner
 from types import SimpleNamespace
-from .universe import load_sp500_tickers, load_sp500_meta
+from .universe import load_tickers, load_meta, universe_hash
 
 
 
@@ -14,18 +14,15 @@ def _resolve_universe_paths(cfg):
     tfile = getattr(u, "tickers_file", None) if u else None
     mfile = getattr(u, "meta_file", None) if u else None
     # mögliche CLI/Config-Felder
-    tfile = tfile or getattr(cfg, "tickers", None)
-    mfile = mfile or getattr(cfg, "sector_meta", None)
-    # Fallback auf Package-Root
-    tfile = tfile or (PKG_ROOT / "sp500_tickers.txt")
-    mfile = mfile or (PKG_ROOT / "sp500_meta.csv")
+    tfile = tfile or getattr(cfg, "tickers_file", None) or getattr(cfg, "tickers", None)
+    mfile = mfile or getattr(cfg, "sector_meta_file", None) or getattr(cfg, "sector_meta", None)
     return Path(tfile), Path(mfile)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--tickers", type=Path, default=PKG_ROOT / "sp500_tickers.txt")
-    p.add_argument("--sector-meta", type=Path, default=PKG_ROOT / "sp500_meta.csv")
+    p.add_argument("--tickers", type=Path)
+    p.add_argument("--sector-meta", type=Path)
     p.add_argument("--save-dir", type=Path, default=PKG_ROOT)   # alles hierhin schreiben
     p.add_argument("--force", action="store_true")
     p.add_argument("--verbose", action="store_true")
@@ -44,18 +41,16 @@ def main():
     cfg = Config.from_cli()
     # Universe auflösen und anhängen
     tickers_file, meta_file = _resolve_universe_paths(cfg)
-    tickers = load_sp500_tickers(str(tickers_file))
-    meta = load_sp500_meta(str(meta_file))
-    object.__setattr__(cfg, "universe", SimpleNamespace(
+    tickers = load_tickers(str(tickers_file))
+    meta = load_meta(str(meta_file))
+    object.__setattr__(cfg, "universe_data", SimpleNamespace(
+        name=getattr(cfg.universe, "name", "sp500"),
         tickers=tickers,
         meta=meta,
         tickers_file=str(tickers_file),
         meta_file=str(meta_file),
+        hash=universe_hash(tickers),
     ))
-    cfg.universe.tickers = tickers
-    cfg.universe.meta = meta
-    cfg.universe.tickers_file = str(tickers_file)
-    cfg.universe.meta_file = str(meta_file)
     Runner(cfg).run()
 
 if __name__ == "__main__":

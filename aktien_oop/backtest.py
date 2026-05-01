@@ -4,7 +4,11 @@ import argparse
 import hashlib
 import json, sys, platform, getpass, socket
 
-from aktien_oop.universe import load_sp500_tickers, load_sp500_meta
+from aktien_oop.universe import (
+    load_tickers as load_universe_tickers,
+    load_meta,
+    universe_hash,
+)
 
 try:
     from zoneinfo import ZoneInfo  # Py>=3.9
@@ -101,6 +105,7 @@ class BTConfig:
     vol_days: int = 63
 
     verbose: bool = False
+    universe_name: str = "sp500"
 
 # ---------------------------------------
 # Hilfen
@@ -158,13 +163,7 @@ def _sanitize_for_fs(s: str) -> str:
     return s
 
 def load_tickers(path: str) -> List[str]:
-    syms = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith("#"):
-                syms.append(s)
-    return sorted(set(syms))
+    return sorted(set(load_universe_tickers(path)))
 
 def load_sector_map(path: Optional[str]) -> Dict[str, str]:
     """
@@ -239,9 +238,9 @@ def _resolve_universe_paths(cfg):
     m = _cfg_get(cfg, "universe.meta_file")
     # Fallbacks für ältere Configs
     if not t:
-        t = _cfg_get(cfg, "aktien_oop.tickers_file") or _cfg_get(cfg, "tickers_file") or "aktien_oop/sp500_tickers.txt"
+        t = _cfg_get(cfg, "aktien_oop.tickers_file") or _cfg_get(cfg, "tickers_file")
     if not m:
-        m = _cfg_get(cfg, "aktien_oop.meta_file") or _cfg_get(cfg, "meta_file") or "aktien_oop/sp500_meta.csv"
+        m = _cfg_get(cfg, "aktien_oop.meta_file") or _cfg_get(cfg, "meta_file") or _cfg_get(cfg, "sector_meta")
     return t, m
 
 def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
@@ -526,10 +525,14 @@ class Backtester:
         self.cfg = cfg
         self.data = DataClient(cfg)
         # -- Universe-Loader: zentral & identisch zum Runner --
-        from aktien_oop.universe import load_sp500_tickers, load_sp500_meta
         ufile, mfile = _resolve_universe_paths(self.cfg)
-        self.tickers = load_sp500_tickers(ufile)
-        self.meta = load_sp500_meta(mfile)
+        self.tickers = load_universe_tickers(str(ufile))
+        self.meta = load_meta(str(mfile))
+        self.universe_name = str(getattr(self.cfg, "universe_name", "sp500") or "sp500")
+        self.universe_file = str(ufile)
+        self.universe_hash = universe_hash(self.tickers)
+        self.cfg.tickers_file = str(ufile)
+        self.cfg.sector_meta = str(mfile)
         Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
     def _dbg(self, msg: str):
@@ -700,8 +703,7 @@ class Backtester:
         try:
             universe_all = list(self.tickers)  # falls du self.tickers setzt
         except Exception:
-            # Fallback: S&P500 laden – falls du das in deinem Projekt nutzt
-            universe_all = load_sp500_tickers()
+            universe_all = load_universe_tickers(str(self.cfg.tickers_file))
 
         # 2.2) Sector-Map (Ticker -> Sektor) – MUSS lockstep zum Runner sein
         secmap_loaded = load_sector_map(self.cfg.sector_meta)  # z.B. aktien_oop/sp500_meta.csv
@@ -709,7 +711,7 @@ class Backtester:
         # fallback nur wenn wirklich nichts geladen werden konnte
         if not secmap_loaded:
             try:
-                meta_df = load_sp500_meta()  # falls das bei dir intern funktioniert
+                meta_df = load_meta(str(self.cfg.sector_meta))
                 if isinstance(meta_df, dict):
                     # meta_df: { "AAPL": {"sector": "..."} , ... }
                     secmap_loaded = {
@@ -838,7 +840,7 @@ class Backtester:
                     # --- LOCKSTEP: BT-Parameter/Universe-Check (Skip-Zweig) ---
                     _cfg = self.cfg
                     _univ = list(self.tickers)  # Backtester lädt sie in __init__
-                    _univ_sha = hashlib.sha1(("|".join(sorted(map(str, _univ)))).encode()).hexdigest()
+                    _univ_sha = universe_hash(_univ)
                     _asof_dbg = _asof_ts.strftime("%Y-%m-%d")
 
                     print(
@@ -847,7 +849,8 @@ class Backtester:
                         f"use_sector_limits={bool(getattr(_cfg, 'use_sector_limits', True))} "
                         f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
                         f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
-                        f"universe_len={len(_univ)} sha={_univ_sha}"
+                        f"universe_name={self.universe_name} universe_file={self.universe_file} "
+                        f"universe_len={len(_univ)} universe_hash={_univ_sha}"
                     )
 
                     # --- /LOCKSTEP ---
@@ -877,6 +880,10 @@ class Backtester:
                         turnover_raw=0.0,
                         turnover_eff=0.0,
                         holdings=list(eff_new.sort_values(ascending=False).index),
+                        universe_name=self.universe_name,
+                        universe_file=self.universe_file,
+                        universe_len=len(_univ),
+                        universe_hash=_univ_sha,
                     )
                 continue
 
@@ -1206,7 +1213,7 @@ class Backtester:
                 # --- LOCKSTEP: BT-Parameter/Universe-Check (Trade-Zweig) ---
                 _cfg = self.cfg
                 _univ = list(self.tickers)
-                _univ_sha = hashlib.sha1(("|".join(sorted(map(str, _univ)))).encode()).hexdigest()
+                _univ_sha = universe_hash(_univ)
                 _asof_dbg = _asof_ts.strftime("%Y-%m-%d")
 
                 print(
@@ -1215,7 +1222,8 @@ class Backtester:
                     f"use_sector_limits={bool(getattr(_cfg, 'use_sector_limits', True))} "
                     f"max_per_sector={getattr(_cfg, 'max_per_sector', None)} "
                     f"score_days={int(score_days)} vol_days={int(vol_days)} adjusted={bool(adjusted)} "
-                    f"universe_len={len(_univ)} sha={_univ_sha}"
+                    f"universe_name={self.universe_name} universe_file={self.universe_file} "
+                    f"universe_len={len(_univ)} universe_hash={_univ_sha}"
                 )
                 # --- /LOCKSTEP ---
 
@@ -1247,6 +1255,10 @@ class Backtester:
                     turnover_raw=float(locals().get("raw_turnover", float("nan"))),
                     turnover_eff=float(locals().get("turnover_eff", float("nan"))),
                     holdings=list(eff_new.sort_values(ascending=False).index),
+                    universe_name=self.universe_name,
+                    universe_file=self.universe_file,
+                    universe_len=len(_univ),
+                    universe_hash=_univ_sha,
                 )
 
         # === POST-LOOP: Equity/Benchmark/Summary/META (einmalig) ===
@@ -1658,6 +1670,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
 
     regime_cfg = cfg_toml.get("regime") or {}
     limits_cfg = cfg_toml.get("limits") or {}
+    universe_cfg = cfg_toml.get("universe") or {}
 
     raw = (
             regime_cfg.get("regime_below_action")
@@ -1669,8 +1682,8 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
         act = "HOLD"
 
     return BTConfig(
-        tickers_file     = _coalesce(a.tickers,           cfg_toml.get("tickers_file"),   "aktien_oop/sp500_tickers.txt"),
-        sector_meta      = _coalesce(a.sector_meta,       cfg_toml.get("sector_meta"),    None),
+        tickers_file     = _coalesce(a.tickers,           universe_cfg.get("tickers_file"), cfg_toml.get("tickers_file"), "aktien_oop/sp500_tickers.txt"),
+        sector_meta      = _coalesce(a.sector_meta,       universe_cfg.get("meta_file"), cfg_toml.get("meta_file"), cfg_toml.get("sector_meta"), None),
         save_dir         = _coalesce(a.save_dir,          cfg_toml.get("save_dir"),       "aktien_oop"),
 
         start            = _coalesce(a.start,             cfg_toml.get("start"),          "2018-01-01"),
@@ -1787,6 +1800,7 @@ def _build_cfg_from_config_and_cli(a: argparse.Namespace) -> BTConfig:
                                     cfg_toml.get("cash_yield_annual"), 0.0),
 
         verbose=_coalesce(a.verbose if a.verbose else None, cfg_toml.get("verbose"), False),
+        universe_name=str(universe_cfg.get("name", cfg_toml.get("universe_name", "sp500")) or "sp500"),
     )
 
 
@@ -1849,6 +1863,7 @@ def main():
     cfg = _build_cfg_from_config_and_cli(args)
     print(f"[CFG] benchmark={cfg.benchmark} dual_benchmark={cfg.dual_benchmark} benchmark2={cfg.benchmark2}")
     print(f"[CFG] dump_decision_bundles={cfg.dump_decision_bundles} decisions_dir={cfg.decisions_dir}")
+    print(f"[CFG] universe_name={cfg.universe_name} universe_file={cfg.tickers_file}")
 
     # --- Run meta (global) ---
     iso, run_id = _now_local_str("Europe/Berlin")

@@ -8,7 +8,6 @@ import itertools
 import datetime
 import numpy as np
 import pandas as pd
-import hashlib
 from pathlib import Path
 from aktien_oop.core_calc import CalcParams, calculate_portfolio, slice_to_window, _rank_desc_stable
 
@@ -21,6 +20,7 @@ from .data_client import DataClient
 from .engine import SignalEngine
 from .store import PortfolioStore
 from .rebalance import Rebalancer
+from .universe import load_tickers as load_universe_tickers, universe_hash
 
 def _json_default(obj):
     """
@@ -169,6 +169,12 @@ class RunCfgNormalized:
 class Runner:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        universe = getattr(cfg, "universe", None)
+        self.universe_name = str(getattr(universe, "name", "sp500") or "sp500")
+        self.universe_file = Path(getattr(universe, "tickers_file", cfg.tickers_file))
+        self.universe_meta_file = Path(getattr(universe, "meta_file", cfg.sector_meta_file))
+        object.__setattr__(self.cfg, "tickers_file", self.universe_file)
+        object.__setattr__(self.cfg, "sector_meta_file", self.universe_meta_file)
         self.data = DataClient(cfg)
         self.engine = SignalEngine(cfg, self.data)
         self.store = PortfolioStore(cfg.save_dir)
@@ -242,6 +248,7 @@ class Runner:
 
         # 2) Laufzeit-Stamp für eindeutige Dateinamen
         run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        tickers = self.load_tickers()
 
         # 3) Bundle aufbauen – as_of als Datum-String
         bundle = {
@@ -253,6 +260,10 @@ class Runner:
             "turnover_raw": float(turnover_raw) if turnover_raw is not None else None,
             "turnover_eff": float(turnover_eff) if turnover_eff is not None else None,
             "first_run_no_prev_state": bool(first_run_no_prev_state),
+            "universe_name": self.universe_name,
+            "universe_file": str(self.universe_file),
+            "universe_len": len(tickers),
+            "universe_hash": universe_hash(tickers),
         }
 
         if isinstance(regime, dict):
@@ -269,8 +280,7 @@ class Runner:
     def load_tickers(self) -> List[str]:
         """Liest das Universum aus Datei und normalisiert Yahoo-kompatibel."""
         try:
-            with open(self.cfg.tickers_file, "r", encoding="utf-8") as f:
-                raw = [line.strip() for line in f if line.strip()]
+            raw = load_universe_tickers(str(self.universe_file))
             ticks = sorted(set(normalize_ticker(t) for t in raw))
             if not ticks:
                 raise ValueError("Datei leer")
@@ -278,14 +288,14 @@ class Runner:
         except Exception as e:
             logging.warning(
                 "Konnte '%s' nicht laden (%s). Fallback: AAPL, MSFT, NVDA",
-                self.cfg.tickers_file, e
+                self.universe_file, e
             )
             return ["AAPL", "MSFT", "NVDA"]
 
     def _load_sector_map(self) -> Dict[str, str]:
         """Lädt Ticker→Sektor aus cfg.sector_meta_file (falls vorhanden)."""
         try:
-            df = pd.read_csv(self.cfg.sector_meta_file)
+            df = pd.read_csv(self.universe_meta_file)
             if "ticker" not in df.columns or "sector" not in df.columns:
                 return {}
             df["ticker"] = df["ticker"].astype(str).map(normalize_ticker)
@@ -543,6 +553,13 @@ class Runner:
         tickers = self.load_tickers()
         sector_map = self._load_sector_map()
         logging.info("Starte Bewertung (%d Ticker)...", len(tickers))
+        logging.info(
+            "Universe: name=%s file=%s len=%d hash=%s",
+            self.universe_name,
+            self.universe_file,
+            len(tickers),
+            universe_hash(tickers),
+        )
         has_sector_meta = bool(sector_map)
         # Sichtbare Zusammenfassung der Sektor-Settings
         limits_active = bool(getattr(self.cfg, "use_sector_limits", True)) and has_sector_meta and (
@@ -555,7 +572,7 @@ class Runner:
             f"use_sector_limits={getattr(self.cfg, 'use_sector_limits', True)} | "
             f"max_per_sector={self.cfg.max_per_sector} | "
             f"sector_limits={self.cfg.sector_limits or '-'} | "
-            f"meta={self.cfg.sector_meta_file}"
+            f"meta={self.universe_meta_file}"
         )
 
         # Markt-Regime-Filter (S&P 500 > 200DMA?)
@@ -786,7 +803,7 @@ class Runner:
             # --- LOCKSTEP: RUN-Parameter/Universe-Check ---
 
             ticks = self.load_tickers()
-            univ_sha = hashlib.sha1(("|".join(sorted(map(str, ticks)))).encode()).hexdigest()
+            univ_sha = universe_hash(ticks)
 
             old_w_dict = old_w  # dict
             new_w_dict = weights  # dict
@@ -803,7 +820,8 @@ class Runner:
 
             logging.info(
                 "[LOCKSTEP][RUN] as_of=%s top_k=%d buffer_k=%d use_sector_limits=%s max_per_sector=%s "
-                "score_days=%d vol_days=%d adjusted=%s universe_len=%d sha=%s",
+                "score_days=%d vol_days=%d adjusted=%s universe_name=%s universe_file=%s "
+                "universe_len=%d universe_hash=%s",
                 as_of_str,
                 self.cfg.top_k,
                 self.cfg.buffer_k,
@@ -812,6 +830,8 @@ class Runner:
                 norm["score_days"],
                 norm["vol_days"],
                 params.adjusted,
+                self.universe_name,
+                str(self.universe_file),
                 len(tickers),
                 univ_sha,
             )
@@ -835,6 +855,10 @@ class Runner:
             "adjusted": self.cfg.adjusted, "period": self.cfg.period, "days_win": self.cfg.days_win,
             "gap_th": self.cfg.gap_th, "adv_min": self.cfg.adv_min_dollars,
             "top_k": self.cfg.top_k, "buffer_k": self.cfg.buffer_k,
+            "universe_name": self.universe_name,
+            "universe_file": str(self.universe_file),
+            "universe_len": len(tickers),
+            "universe_hash": universe_hash(tickers),
             "num_universe": len(tickers), "num_pass": len(df),
             "fail_counts": dict(self.engine.fail_counts),
             "sector_limits_active": limits_active,
@@ -848,6 +872,10 @@ class Runner:
             sector_counts = sel["ticker"].map(sector_map).fillna("Unknown").value_counts().to_dict()
         meta = {
             "as_of": as_of_str,
+            "universe_name": self.universe_name,
+            "universe_file": str(self.universe_file),
+            "universe_len": len(tickers),
+            "universe_hash": universe_hash(tickers),
             "universe_size": len(tickers),
             "num_pass": int(len(df)),
             "adjusted": self.cfg.adjusted,
@@ -860,7 +888,7 @@ class Runner:
             "sector_limits_active": limits_active,
             "max_per_sector": self.cfg.max_per_sector,
             "sector_limits": self.cfg.sector_limits,
-            "sector_meta_file": str(self.cfg.sector_meta_file),
+            "sector_meta_file": str(self.universe_meta_file),
             "selected_sector_counts": sector_counts,
             "fail_counts": dict(self.engine.fail_counts),
         }
@@ -966,8 +994,8 @@ class Runner:
             buffer_k=self.cfg.buffer_k,
             max_per_sector=self.cfg.max_per_sector,
             sector_limits_on=bool(sector_map),  # True, wenn Sektor-Map geladen war
-            tickers_file=str(self.cfg.tickers_file),
-            sector_meta_file=str(self.cfg.sector_meta_file),
+            tickers_file=str(self.universe_file),
+            sector_meta_file=str(self.universe_meta_file),
             filters=filter_stats,  # landet in meta_json
         )
 

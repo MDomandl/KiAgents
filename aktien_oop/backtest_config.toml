@@ -17,8 +17,6 @@ decisions_dir = "aktien_oop/decisions"
 decision_prefix = "BT"
 
 # --- Daten & Pfade ---
-tickers_file   = "aktien_oop/sp500_tickers.txt"
-sector_meta    = "aktien_oop/sp500_meta.csv"   # optional; leer lassen, wenn nicht vorhanden
 save_dir       = "aktien_oop"
 
 # --- Zeitraum & Frequenz ---
@@ -104,4 +102,9 @@ regime_sma_days = 200
 # - HOLD : Portfolio unverändert weiterführen (keine Umschichtung)
 # - SELL : Alle Positionen schließen (Cash / Flat)
 regime_below_action = "SELL"  # "SELL" | "HOLD"
+
+[universe]
+name = "sp500"
+tickers_file = "aktien_oop/universes/sp500_tickers.txt"
+meta_file = "aktien_oop/universes/sp500_meta.csv"
 
