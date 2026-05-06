@@ -1,4 +1,4 @@
-# store.py
+﻿# store.py
 from pathlib import Path
 import json
 import csv
@@ -26,7 +26,7 @@ class PortfolioStore:
             return None
 
         if "as_of" not in df.columns:
-            logging.warning("positions.csv hat keine 'as_of'-Spalte – kann nicht 'before(as_of)' selektieren.")
+            logging.warning("positions.csv hat keine 'as_of'-Spalte â€“ kann nicht 'before(as_of)' selektieren.")
             return None
 
         df["as_of"] = pd.to_datetime(df["as_of"]).dt.normalize()
@@ -70,8 +70,9 @@ class PortfolioStore:
                 else:
                     existing["as_of"] = pd.to_datetime(existing["as_of"], errors="coerce").dt.normalize()
                     existing["ticker"] = existing["ticker"].astype(str)
-                    snapshot_dates = set(df["as_of"].dropna())
-                    existing = existing[~existing["as_of"].isin(snapshot_dates)]
+                    incoming_keys = set(zip(df["as_of"], df["ticker"]))
+                    existing_keys = list(zip(existing["as_of"], existing["ticker"]))
+                    existing = existing[[key not in incoming_keys for key in existing_keys]]
                     combined = pd.concat([existing, df], ignore_index=True, sort=False)
             else:
                 combined = df
@@ -83,7 +84,7 @@ class PortfolioStore:
         combined.to_csv(self.positions_path, index=False)
 
     def last_rebalance_time(self):
-        """Jüngsten Timestamp aus runs_log oder positions ermitteln (robust)."""
+        """JÃ¼ngsten Timestamp aus runs_log oder positions ermitteln (robust)."""
         ts = None
         if self.runs_log.exists():
             try:
@@ -93,7 +94,7 @@ class PortfolioStore:
                     if not r["as_of"].isna().all():
                         ts = r["as_of"].max()
             except Exception:
-                # Falls die Datei mal wieder „krumm“ ist, einfach ignorieren.
+                # Falls die Datei mal wieder â€žkrummâ€œ ist, einfach ignorieren.
                 pass
 
         if ts is None and self.positions_path.exists():
@@ -155,16 +156,16 @@ class PortfolioStore:
                 on_bad_lines="error"  # wechsle auf 'error', damit wir sauber in den Fallback springen
             )
         except Exception:
-            # 2. Fallback: Zeilen manuell parsen und Überlauf in 'Flags' zurückführen
+            # 2. Fallback: Zeilen manuell parsen und Ãœberlauf in 'Flags' zurÃ¼ckfÃ¼hren
             rows = []
             with open(self.topk_log, "r", encoding="utf-8", newline="") as f:
                 rdr = csv.reader(f, delimiter=",", quotechar='"', doublequote=True)
-                header = next(rdr, None)  # Header überspringen
+                header = next(rdr, None)  # Header Ã¼berspringen
                 for parts in rdr:
                     if len(parts) > 7:
-                        parts = parts[:6] + [",".join(parts[6:])]  # Rest wieder an Flags anhängen
+                        parts = parts[:6] + [",".join(parts[6:])]  # Rest wieder an Flags anhÃ¤ngen
                     elif len(parts) < 7:
-                        # fehlende Spalten auffüllen, damit der Frame passt
+                        # fehlende Spalten auffÃ¼llen, damit der Frame passt
                         parts += [""] * (7 - len(parts))
                     rows.append(parts)
             df = pd.DataFrame(rows, columns=expected)
@@ -182,7 +183,8 @@ class PortfolioStore:
     def write_positions(self, df: pd.DataFrame):
         df.to_csv(self.positions_path, index=False, encoding="utf-8")
 
-    # ⬇️ neu
+    # â¬‡ï¸ neu
     def append_jsonl(self, path: Path, record: dict):
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
