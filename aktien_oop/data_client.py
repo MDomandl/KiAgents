@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .config import Config, normalize_ticker
 from typing import Any
 from .utils import as_series
+from .market_data_cache import MarketDataRequest, get_default_market_data_cache
 
 @dataclass(frozen=True)
 class RegimeDecision:
@@ -18,6 +19,7 @@ class RegimeDecision:
 class DataClient:
     def __init__(self, cfg: Any):
         self.cfg = cfg
+        self._market_cache = get_default_market_data_cache()
 
     @staticmethod
     def _ensure_ohlc(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
@@ -60,7 +62,7 @@ class DataClient:
             return 800
 
     # ---------- FIX 2: OHLC loader uses as_of/period/adjusted ----------
-    def download_ohlc(
+    def _download_ohlc_uncached(
         self,
         ticker: str,
         *,
@@ -68,15 +70,6 @@ class DataClient:
         period: str | None = None,
         adjusted: bool = True,
     ) -> Optional[pd.DataFrame]:
-        """
-        Lädt OHLC-Daten für EINEN Ticker.
-
-        Wichtig:
-        - Wenn as_of gesetzt ist, ist yfinance 'end' EXKLUSIV -> end = as_of + 1 Tag,
-          damit der as_of-Handelstag sicher enthalten ist.
-        - Lookback wird aus 'period' abgeleitet (nicht aus cfg.max_lookback_days),
-          damit Runner und BT identische Fenster benutzen können.
-        """
         t_norm = normalize_ticker(ticker)
         period = period or getattr(self.cfg, "period", "800d")
         adjusted = bool(adjusted)
@@ -87,16 +80,17 @@ class DataClient:
             cutoff = pd.Timestamp(as_of).tz_localize(None).normalize()
             days = self._period_to_days(str(period))
             start_s = (cutoff - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-            end_s = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # end exklusiv!
+            end_s = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             df = yf.download(t_norm, start=start_s, end=end_s, **kw)
         else:
+            start_s = None
+            end_s = None
             df = yf.download(t_norm, period=str(period), **kw)
 
         df = self._ensure_ohlc(df, ticker)
         if df is not None:
             return df
 
-        # Fallback: Roh-Ticker
         if as_of is not None:
             df = yf.download(ticker, start=start_s, end=end_s, **kw)
         else:
@@ -104,11 +98,44 @@ class DataClient:
 
         return self._ensure_ohlc(df, ticker)
 
-    def get_prices(self, universe, as_of, period, adjusted=True) -> pd.DataFrame:
-        """
-        Baut eine Close-Matrix (Index=Date, Spalten=Ticker) für genau das Fenster:
-        [as_of - period, as_of] (inklusive).
-        """
+    def download_ohlc(
+        self,
+        ticker: str,
+        *,
+        as_of: str | pd.Timestamp | None = None,
+        period: str | None = None,
+        adjusted: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        period = period or getattr(self.cfg, "period", "800d")
+        cutoff = pd.Timestamp(as_of).tz_localize(None).normalize() if as_of is not None else None
+        start_s = None
+        end_s = None
+        if cutoff is not None:
+            days = self._period_to_days(str(period))
+            start_s = (cutoff - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+            end_s = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        request = MarketDataRequest.build(
+            data_kind="ohlc",
+            tickers=[ticker],
+            start=start_s,
+            end=end_s,
+            period=period if cutoff is None else None,
+            as_of=cutoff,
+            adjusted=adjusted,
+        )
+        frame = self._market_cache.get_or_load_frame(
+            request,
+            lambda: self._download_ohlc_uncached(
+                ticker,
+                as_of=cutoff,
+                period=period,
+                adjusted=adjusted,
+            ),
+        )
+        return self._ensure_ohlc(frame, ticker) if frame is not None else None
+
+    def _get_prices_uncached(self, universe, as_of, period, adjusted=True) -> pd.DataFrame:
         cutoff = pd.Timestamp(as_of).tz_localize(None).normalize() if as_of else None
         lookback_days = self._period_to_days(str(period))
         start = (cutoff - pd.Timedelta(days=lookback_days)) if cutoff is not None else None
@@ -121,8 +148,6 @@ class DataClient:
 
             idx = pd.to_datetime(df.index).tz_localize(None)
             df = df.set_index(idx).sort_index()
-
-            # Nach _ensure_ohlc existiert "Close" sicher
             s = df["Close"].astype(float).rename(t)
 
             if cutoff is not None:
@@ -138,11 +163,50 @@ class DataClient:
         mat = mat.dropna(how="all")
         return mat
 
+    def get_prices(self, universe, as_of, period, adjusted=True) -> pd.DataFrame:
+        cutoff = pd.Timestamp(as_of).tz_localize(None).normalize() if as_of else None
+        start_s = None
+        end_s = None
+        if cutoff is not None:
+            lookback_days = self._period_to_days(str(period))
+            start_s = (cutoff - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            end_s = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+        request = MarketDataRequest.build(
+            data_kind="close",
+            tickers=universe,
+            start=start_s,
+            end=end_s,
+            period=period if cutoff is None else None,
+            as_of=cutoff,
+            adjusted=adjusted,
+        )
+        frame = self._market_cache.get_or_load_frame(
+            request,
+            lambda: self._get_prices_uncached(universe, cutoff, period, adjusted),
+        )
+        return frame if frame is not None else pd.DataFrame()
+
     # ---------- FIX 3: Series/Scalar robust (keine ambige truth values) ----------
     def sp500_above_200dma(self, as_of: str, sma_days: int = 200, period: str = "800d") -> bool:
         as_of_ts = pd.Timestamp(as_of).normalize()
 
-        px = yf.download("^GSPC", period=period, auto_adjust=False, progress=False)
+        days = self._period_to_days(str(period))
+        start_s = (as_of_ts - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+        end_s = (as_of_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        request = MarketDataRequest.build(
+            data_kind="benchmark",
+            tickers=["^GSPC"],
+            start=start_s,
+            end=end_s,
+            as_of=as_of_ts,
+            adjusted=False,
+            benchmark_symbol="^GSPC",
+        )
+        px = self._market_cache.get_or_load_frame(
+            request,
+            lambda: yf.download("^GSPC", start=start_s, end=end_s, auto_adjust=False, progress=False),
+        )
         if px is None or getattr(px, "empty", True):
             return True  # defensiv
 

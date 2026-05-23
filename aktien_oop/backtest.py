@@ -25,6 +25,7 @@ from .config import Config
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from .market_data_cache import MarketDataRequest, get_default_market_data_cache
 
 try:
     import tomllib  # Py 3.11+
@@ -243,7 +244,7 @@ def _resolve_universe_paths(cfg):
         m = _cfg_get(cfg, "aktien_oop.meta_file") or _cfg_get(cfg, "meta_file") or _cfg_get(cfg, "sector_meta")
     return t, m
 
-def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
+def _download_close_uncached(tickers, start, end, verbose=False) -> pd.DataFrame:
     import time
     cols = {}
     failed = []
@@ -274,13 +275,13 @@ def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
             continue
 
         s = df["Close"].astype(float)
-        s.name = t                     # <<< hier der wichtige Fix
+        s.name = t
         cols[t] = s
 
     if verbose:
         print(f"Erfolg: {len(cols)} / {len(tickers)}   Fehlgeschlagen: {len(failed)}")
         if failed:
-            print("Fehler bei:", ", ".join(failed[:20]) + (" …" if len(failed) > 20 else ""))
+            print("Fehler bei:", ", ".join(failed[:20]) + (" ..." if len(failed) > 20 else ""))
 
     if not cols:
         return pd.DataFrame()
@@ -288,6 +289,30 @@ def download_close(tickers, start, end, verbose=False) -> pd.DataFrame:
     return pd.concat(cols, axis=1).sort_index()
 
 
+def download_close(
+    tickers,
+    start,
+    end,
+    verbose=False,
+    *,
+    data_kind: str = "close",
+    adjusted: bool = True,
+    benchmark_symbol: str | None = None,
+) -> pd.DataFrame:
+    request = MarketDataRequest.build(
+        data_kind=data_kind,
+        tickers=tickers,
+        start=start,
+        end=end,
+        adjusted=adjusted,
+        benchmark_symbol=benchmark_symbol,
+        allow_missing_tickers=True,
+    )
+    frame = get_default_market_data_cache().get_or_load_frame(
+        request,
+        lambda: _download_close_uncached(tickers, start, end, verbose=verbose),
+    )
+    return frame if frame is not None else pd.DataFrame()
 
 def rebal_dates(px: pd.DataFrame, start: str, end: str, freq: str) -> List[pd.Timestamp]:
     """
@@ -655,7 +680,7 @@ class Backtester:
         bm_sma = None
         if regime_on:
             bm_tk = self.cfg.benchmark_ticker or "SXR8.DE"
-            bm_px = download_close([bm_tk], self.cfg.start, self.cfg.end, verbose=False)
+            bm_px = download_close([bm_tk], self.cfg.start, self.cfg.end, verbose=False, data_kind="benchmark", benchmark_symbol=bm_tk)
             bm_px = _normalize_price_columns(bm_px)
             if not bm_px.empty:
                 s = bm_px.iloc[:, 0].astype(float).dropna()
@@ -1307,7 +1332,7 @@ class Backtester:
             start_s, end_s = str(start_dt.date()), str(end_dt.date())
 
             # 2) Download immer als Liste aufrufen (sonst wird "SPY" zu ["S","P","Y"])
-            bm_px = download_close([ticker], start=start_s, end=end_s)
+            bm_px = download_close([ticker], start=start_s, end=end_s, data_kind="benchmark", benchmark_symbol=ticker)
 
             # 3) Rückgabe-Typen entpacken
             if isinstance(bm_px, tuple) and len(bm_px) >= 1:
