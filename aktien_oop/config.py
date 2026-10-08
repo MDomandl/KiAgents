@@ -141,6 +141,8 @@ class Config:
     require_above_sma: bool = False
     regime_below_action: str = "HOLD"
     regime_sma_days: int = 200  # z.B. 200 Kalendertage
+    include_cash: bool = False
+    cash_yield_annual: float = 0.0
 
     show_plots: bool = False
     # Decision Bundles (für Comparator / Runner)
@@ -255,6 +257,10 @@ class Config:
 
         require_above_sma = bool(regime_cfg.get("require_above_sma", cfg_toml.get("require_above_sma", False)))
         regime_sma_days = int(regime_cfg.get("regime_sma_days", cfg_toml.get("regime_sma_days", 200)) or 200)
+        include_cash = bool(regime_cfg.get("include_cash", cfg_toml.get("include_cash", False)))
+        cash_yield_annual = float(
+            regime_cfg.get("cash_yield_annual", cfg_toml.get("cash_yield_annual", 0.0)) or 0.0
+        )
 
         _act = str(regime_cfg.get("regime_below_action", cfg_toml.get("regime_below_action", "HOLD")) or "HOLD").upper()
         if _act not in ("HOLD", "SELL"):
@@ -361,6 +367,8 @@ class Config:
             require_above_sma=require_above_sma,
             regime_sma_days=regime_sma_days,
             regime_below_action=regime_below_action,
+            include_cash=include_cash,
+            cash_yield_annual=cash_yield_annual,
 
             use_equal_weight=_coalesce(args.use_equal_weight,
                                        d.get("use_equal_weight"),
