@@ -50,7 +50,12 @@ class PortfolioStore:
             df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce")
         return df
 
-    def save_positions(self, df: pd.DataFrame) -> None:
+    def save_positions(
+        self,
+        df: pd.DataFrame,
+        *,
+        snapshot_as_of: str | pd.Timestamp | None = None,
+    ) -> None:
         df = df.copy()
         if "as_of" not in df.columns:
             df.insert(0, "as_of", pd.Timestamp.now())
@@ -61,6 +66,13 @@ class PortfolioStore:
         df = df.dropna(subset=["as_of", "ticker"])
         df["ticker"] = df["ticker"].astype(str)
 
+        replacement_as_of = set(df["as_of"])
+        if snapshot_as_of is not None:
+            explicit_as_of = pd.to_datetime(snapshot_as_of, errors="coerce")
+            if pd.isna(explicit_as_of):
+                raise ValueError("snapshot_as_of must be a valid timestamp")
+            replacement_as_of.add(pd.Timestamp(explicit_as_of).normalize())
+
         if self.positions_path.exists():
             existing = pd.read_csv(self.positions_path)
             if not existing.empty:
@@ -70,9 +82,8 @@ class PortfolioStore:
                 else:
                     existing["as_of"] = pd.to_datetime(existing["as_of"], errors="coerce").dt.normalize()
                     existing["ticker"] = existing["ticker"].astype(str)
-                    incoming_as_of = set(df["as_of"])
-                    existing = existing[~existing["as_of"].isin(incoming_as_of)]
-                    combined = pd.concat([existing, df], ignore_index=True, sort=False)
+                    existing = existing[~existing["as_of"].isin(replacement_as_of)]
+                    combined = existing if df.empty else pd.concat([existing, df], ignore_index=True, sort=False)
             else:
                 combined = df
         else:

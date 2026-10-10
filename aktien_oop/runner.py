@@ -984,7 +984,7 @@ class Runner:
 
         logging.info("Filter-Statistik: %s", dict(self.engine.fail_counts))
 
-        self.store.save_positions(sel)
+        self.store.save_positions(sel, snapshot_as_of=as_of_str)
 
         filter_stats = locals().get("filter_stats", {})
 
