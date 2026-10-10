@@ -70,9 +70,8 @@ class PortfolioStore:
                 else:
                     existing["as_of"] = pd.to_datetime(existing["as_of"], errors="coerce").dt.normalize()
                     existing["ticker"] = existing["ticker"].astype(str)
-                    incoming_keys = set(zip(df["as_of"], df["ticker"]))
-                    existing_keys = list(zip(existing["as_of"], existing["ticker"]))
-                    existing = existing[[key not in incoming_keys for key in existing_keys]]
+                    incoming_as_of = set(df["as_of"])
+                    existing = existing[~existing["as_of"].isin(incoming_as_of)]
                     combined = pd.concat([existing, df], ignore_index=True, sort=False)
             else:
                 combined = df
