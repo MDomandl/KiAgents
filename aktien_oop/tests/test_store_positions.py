@@ -27,6 +27,23 @@ def test_save_positions_replaces_complete_snapshot_for_same_as_of(tmp_path):
     assert aug["ticker"].tolist() == ["OLD"]
 
 
+def test_save_positions_replaces_snapshot_with_empty_snapshot_for_same_as_of(tmp_path):
+    store = PortfolioStore(tmp_path)
+
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-09-30", "ticker": "AAA", "allocation_pct": 100.0},
+        {"as_of": "2025-10-31", "ticker": "BBB", "allocation_pct": 100.0},
+    ]))
+
+    empty_snapshot = pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"])
+    store.save_positions(empty_snapshot, snapshot_as_of="2025-09-30")
+
+    saved = pd.read_csv(store.positions_path)
+    assert not saved["as_of"].astype(str).str.startswith("2025-09-30").any()
+    assert saved["as_of"].astype(str).str.startswith("2025-10-31").all()
+    assert saved["ticker"].tolist() == ["BBB"]
+
+
 def test_load_positions_before_uses_latest_replaced_snapshot(tmp_path):
     store = PortfolioStore(tmp_path)
 
