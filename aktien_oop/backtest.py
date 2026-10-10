@@ -1147,7 +1147,7 @@ class Backtester:
                     "rank": int(ranks_dict.get(t, 0)) if ranks_dict else 0,
                 })
 
-            tmp = pd.DataFrame(pos_rows)
+            tmp = pd.DataFrame(pos_rows, columns=["ticker", "weight", "score", "rank"])
             # as_of-Spalte vorn einfügen
             tmp.insert(0, "as_of", pd.Timestamp(d).strftime("%Y-%m-%d"))
 
