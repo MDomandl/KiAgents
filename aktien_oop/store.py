@@ -20,17 +20,42 @@ class PortfolioStore:
         save_dir.mkdir(parents=True, exist_ok=True)
         self.positions_path = self.save_dir / "portfolio_positions.csv"
         self.snapshots_path = self.save_dir / "portfolio_snapshots.csv"
+        self.positions_pending_path = self.save_dir / "portfolio_positions.csv.pending"
+        self.snapshots_pending_path = self.save_dir / "portfolio_snapshots.csv.pending"
+        self.snapshots_staging_path = self.save_dir / "portfolio_snapshots.csv.pending.tmp"
         self.rankings_log   = self.save_dir / "rankings_log.csv"
         self.runs_log       = self.save_dir / "runs_log.csv"
         self.topk_log       = self.save_dir / "topk_log.csv"
         self.runs_meta_jsonl = self.save_dir / "runs_meta.jsonl"
 
+    @staticmethod
+    def _replace_file(source: Path, target: Path) -> None:
+        source.replace(target)
+
+    def _snapshot_paths_for_read(self) -> tuple[Path, Path]:
+        if self.snapshots_pending_path.exists():
+            positions_path = (
+                self.positions_pending_path
+                if self.positions_pending_path.exists()
+                else self.positions_path
+            )
+            return positions_path, self.snapshots_pending_path
+        return self.positions_path, self.snapshots_path
+
+    def _complete_pending_snapshot_write(self) -> None:
+        if not self.snapshots_pending_path.exists():
+            return
+        if self.positions_pending_path.exists():
+            self._replace_file(self.positions_pending_path, self.positions_path)
+        self._replace_file(self.snapshots_pending_path, self.snapshots_path)
+
     def load_positions_snapshot_before(
         self,
         as_of: str | pd.Timestamp,
     ) -> PositionSnapshot | None:
-        if self.positions_path.exists():
-            df = pd.read_csv(self.positions_path)
+        positions_path, snapshots_path = self._snapshot_paths_for_read()
+        if positions_path.exists():
+            df = pd.read_csv(positions_path)
         else:
             df = pd.DataFrame()
 
@@ -42,8 +67,8 @@ class PortfolioStore:
             logging.warning("positions.csv hat keine 'as_of'-Spalte â€“ kann nicht 'before(as_of)' selektieren.")
 
         indexed_dates = pd.Series(dtype="datetime64[ns]")
-        if self.snapshots_path.exists():
-            snapshots = pd.read_csv(self.snapshots_path)
+        if snapshots_path.exists():
+            snapshots = pd.read_csv(snapshots_path)
             if "as_of" in snapshots.columns:
                 indexed_dates = pd.to_datetime(
                     snapshots["as_of"], errors="coerce"
@@ -84,6 +109,7 @@ class PortfolioStore:
         *,
         snapshot_as_of: str | pd.Timestamp | None = None,
     ) -> None:
+        self._complete_pending_snapshot_write()
         df = df.copy()
         if "as_of" not in df.columns:
             df.insert(0, "as_of", pd.Timestamp.now())
@@ -119,7 +145,6 @@ class PortfolioStore:
 
         combined = combined.drop_duplicates(subset=["as_of", "ticker"], keep="last")
         combined = combined.sort_values(["as_of", "ticker"], kind="mergesort").reset_index(drop=True)
-        combined.to_csv(self.positions_path, index=False)
 
         snapshot_dates = pd.Series(dtype="datetime64[ns]")
         if self.snapshots_path.exists():
@@ -132,7 +157,14 @@ class PortfolioStore:
                 logging.warning("portfolio_snapshots.csv hat keine 'as_of'-Spalte und wird ersetzt.")
 
         all_snapshot_dates = sorted(set(snapshot_dates) | replacement_as_of)
-        pd.DataFrame({"as_of": all_snapshot_dates}).to_csv(self.snapshots_path, index=False)
+        combined.to_csv(self.positions_pending_path, index=False)
+        pd.DataFrame({"as_of": all_snapshot_dates}).to_csv(
+            self.snapshots_staging_path,
+            index=False,
+        )
+        self._replace_file(self.snapshots_staging_path, self.snapshots_pending_path)
+        self._replace_file(self.positions_pending_path, self.positions_path)
+        self._replace_file(self.snapshots_pending_path, self.snapshots_path)
 
     def last_rebalance_time(self):
         """JÃ¼ngsten Timestamp aus runs_log oder positions ermitteln (robust)."""

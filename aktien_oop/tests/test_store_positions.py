@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from aktien_oop.store import PortfolioStore
 
@@ -103,6 +104,55 @@ def test_load_positions_before_does_not_fall_back_past_empty_snapshot(tmp_path):
 
     assert prev is not None
     assert prev.empty
+
+
+@pytest.mark.parametrize("interrupted_source", ["positions", "snapshots"])
+def test_interrupted_empty_snapshot_write_remains_authoritatively_flat(
+    tmp_path,
+    monkeypatch,
+    interrupted_source,
+):
+    store = PortfolioStore(tmp_path)
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-09-30", "ticker": "OLD", "allocation_pct": 100.0},
+    ]))
+    replace_file = store._replace_file
+
+    def interrupt_during_commit(source, target):
+        interrupted_path = (
+            store.positions_pending_path
+            if interrupted_source == "positions"
+            else store.snapshots_pending_path
+        )
+        if source == interrupted_path:
+            raise OSError("simulated interruption")
+        replace_file(source, target)
+
+    monkeypatch.setattr(store, "_replace_file", interrupt_during_commit)
+
+    with pytest.raises(OSError, match="simulated interruption"):
+        store.save_positions(
+            pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"]),
+            snapshot_as_of="2025-10-31",
+        )
+
+    prev = store.load_positions_before("2025-11-15")
+
+    assert store.snapshots_pending_path.exists()
+    assert prev is not None
+    assert prev.empty
+
+    monkeypatch.setattr(store, "_replace_file", replace_file)
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-11-30", "ticker": "NEW", "allocation_pct": 100.0},
+    ]))
+
+    recovered_empty = store.load_positions_before("2025-11-15")
+    recovered_non_empty = store.load_positions_before("2025-12-15")
+    assert not store.snapshots_pending_path.exists()
+    assert recovered_empty is not None and recovered_empty.empty
+    assert recovered_non_empty is not None
+    assert recovered_non_empty["ticker"].tolist() == ["NEW"]
 
 
 def test_snapshot_history_supports_non_empty_empty_non_empty_transition(tmp_path):
