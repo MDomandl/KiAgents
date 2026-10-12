@@ -23,11 +23,14 @@ Portfolio-Snapshots:
   statt nur übereinstimmende Ticker zu aktualisieren.
 - Ein ausdrücklich leerer Snapshot entfernt über `snapshot_as_of` die bisherigen
   Positionen dieses Stichtags. Ältere und neuere Stichtage bleiben erhalten.
-- `load_positions_before()` berücksichtigt bei nicht leeren Snapshots die
-  vollständige Ersetzung und liefert den letzten gespeicherten Stichtag vor der
-  Anfrage. Ein leerer Snapshot wird jedoch nur durch Entfernen seiner Zeilen
-  abgebildet; es bleibt kein Leer-Marker erhalten. Eine spätere Abfrage kann
-  deshalb auf einen älteren, nicht leeren Snapshot zurückfallen.
+- Der additive Index `portfolio_snapshots.csv` hält jeden ausdrücklich
+  gespeicherten Stichtag fest, ohne das Schema von `portfolio_positions.csv` zu
+  verändern. `load_positions_snapshot_before()` unterscheidet dadurch fehlende,
+  leere und nicht leere Snapshots; `load_positions_before()` liefert für einen
+  bekannten leeren Snapshot ein leeres DataFrame statt auf ältere Positionen
+  zurückzufallen.
+- Der Runner behandelt nur einen fehlenden Snapshot als First Run. Ein bekannter
+  leerer Snapshot ist der autoritative Zustand „flat“.
 
 Diese Semantik ist für `automation-agents` relevant, weil dessen Vergleiche,
 Seed-Logik und Reports die Konfigurationswerte sowie Backtest- und Runner-Artefakte
@@ -55,7 +58,7 @@ Die fokussierten Regressionstests liegen insbesondere in
 unter `aktien_oop/tests` geprüft.
 
 Der dokumentierte Stand wurde am 12. Oktober 2026 mit Python 3.11.9 und den
-synchronisierten Entwicklungsabhängigkeiten geprüft: `26 passed`. Dabei traten
+synchronisierten Entwicklungsabhängigkeiten geprüft: `34 passed`. Dabei traten
 zwei bekannte NumPy-`RuntimeWarning`s im Test des leeren Backtest-Snapshots auf;
 sie führten nicht zu Testfehlern.
 
@@ -69,8 +72,7 @@ nicht überall technisch erzwungen. Beides ist bei späteren Refactorings als
 Kompatibilitäts- beziehungsweise Architekturrisiko zu behandeln; dieser
 Dokumentationsstand nimmt keine entsprechende Produktionsänderung vorweg.
 
-Zusätzlich kann `PortfolioStore` einen ausdrücklich leeren historischen Snapshot
-nicht dauerhaft von einem fehlenden Snapshot unterscheiden. Verbraucher wie die
-Seed-Logik in `automation-agents` müssen diesen Rückfall auf ältere Bestände
-berücksichtigen, bis ein kompatibler Leer-Marker-Vertrag fachlich festgelegt und
-in beiden Projekten abgesichert ist.
+Die Seed-Logik in `automation-agents` ist noch nicht auf die neue tri-state
+Lesegrenze migriert. Sie kann anschließend
+`PortfolioStore.load_positions_snapshot_before()` verwenden, ohne die
+Snapshot-Semantik selbst aus CSV-Zeilen ableiten zu müssen.

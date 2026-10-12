@@ -37,6 +37,9 @@ eigenständige HTTP- oder Paket-API. `automation-agents` setzt insbesondere auf:
 - Positions-CSV-Dateien, besonders Backtest-Snapshots und
   `portfolio_positions.csv`, mit stabilen Spalten wie `as_of`, `ticker`, `weight`,
   `score` und `rank`;
+- den additiven Snapshot-Index `portfolio_snapshots.csv` sowie
+  `PortfolioStore.load_positions_snapshot_before()` für die Unterscheidung von
+  fehlenden, leeren und nicht leeren Portfolio-Snapshots;
 - direkte Python-Imports in Analyse- und Vertragstests, unter anderem
   `aktien_oop.core_calc` und `aktien_oop.store.PortfolioStore`.
 

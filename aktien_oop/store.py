@@ -1,9 +1,17 @@
 ﻿# store.py
 from pathlib import Path
+from dataclasses import dataclass
 import json
 import csv
 import logging
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class PositionSnapshot:
+    as_of: pd.Timestamp
+    positions: pd.DataFrame
+
 
 class PortfolioStore:
 
@@ -11,36 +19,85 @@ class PortfolioStore:
         self.save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         self.positions_path = self.save_dir / "portfolio_positions.csv"
+        self.snapshots_path = self.save_dir / "portfolio_snapshots.csv"
+        self.positions_pending_path = self.save_dir / "portfolio_positions.csv.pending"
+        self.snapshots_pending_path = self.save_dir / "portfolio_snapshots.csv.pending"
+        self.snapshots_staging_path = self.save_dir / "portfolio_snapshots.csv.pending.tmp"
+        self._complete_pending_snapshot_write()
         self.rankings_log   = self.save_dir / "rankings_log.csv"
         self.runs_log       = self.save_dir / "runs_log.csv"
         self.topk_log       = self.save_dir / "topk_log.csv"
         self.runs_meta_jsonl = self.save_dir / "runs_meta.jsonl"
 
-    def load_positions_before(self, as_of: str | pd.Timestamp) -> pd.DataFrame | None:
-        p = self.positions_path
-        if not p.exists():
-            return None
+    @staticmethod
+    def _replace_file(source: Path, target: Path) -> None:
+        source.replace(target)
 
-        df = pd.read_csv(p)
-        if df.empty:
-            return None
+    def _snapshot_paths_for_read(self) -> tuple[Path, Path]:
+        if self.snapshots_pending_path.exists():
+            positions_path = (
+                self.positions_pending_path
+                if self.positions_pending_path.exists()
+                else self.positions_path
+            )
+            return positions_path, self.snapshots_pending_path
+        return self.positions_path, self.snapshots_path
 
-        if "as_of" not in df.columns:
+    def _complete_pending_snapshot_write(self) -> None:
+        if not self.snapshots_pending_path.exists():
+            return
+        if self.positions_pending_path.exists():
+            self._replace_file(self.positions_pending_path, self.positions_path)
+        self._replace_file(self.snapshots_pending_path, self.snapshots_path)
+
+    def load_positions_snapshot_before(
+        self,
+        as_of: str | pd.Timestamp,
+    ) -> PositionSnapshot | None:
+        positions_path, snapshots_path = self._snapshot_paths_for_read()
+        if positions_path.exists():
+            df = pd.read_csv(positions_path)
+        else:
+            df = pd.DataFrame()
+
+        position_dates = pd.Series(dtype="datetime64[ns]")
+        if "as_of" in df.columns:
+            df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce").dt.normalize()
+            position_dates = df["as_of"].dropna()
+        elif not df.empty:
             logging.warning("positions.csv hat keine 'as_of'-Spalte â€“ kann nicht 'before(as_of)' selektieren.")
-            return None
 
-        df["as_of"] = pd.to_datetime(df["as_of"]).dt.normalize()
+        indexed_dates = pd.Series(dtype="datetime64[ns]")
+        if snapshots_path.exists():
+            snapshots = pd.read_csv(snapshots_path)
+            if "as_of" in snapshots.columns:
+                indexed_dates = pd.to_datetime(
+                    snapshots["as_of"], errors="coerce"
+                ).dropna().dt.normalize()
+            elif not snapshots.empty:
+                logging.warning("portfolio_snapshots.csv hat keine 'as_of'-Spalte und wird ignoriert.")
+
+        snapshot_dates = pd.concat([position_dates, indexed_dates], ignore_index=True)
         cur = pd.Timestamp(as_of).normalize()
-
-        df_prev = df[df["as_of"] < cur]
-        if df_prev.empty:
+        previous_dates = snapshot_dates[snapshot_dates < cur]
+        if previous_dates.empty:
             return None
 
-        prev_asof = df_prev["as_of"].max()
-        snap = df_prev[df_prev["as_of"] == prev_asof].copy()
+        prev_asof = previous_dates.max()
+        if "as_of" in df.columns:
+            snap = df[df["as_of"] == prev_asof].copy()
+        else:
+            snap = df.iloc[0:0].copy()
         if "ticker" in snap.columns:
             snap = snap.sort_values("ticker", kind="mergesort").reset_index(drop=True)
-        return snap
+        return PositionSnapshot(as_of=prev_asof, positions=snap)
+
+    def load_positions_before(self, as_of: str | pd.Timestamp) -> pd.DataFrame | None:
+        snapshot = self.load_positions_snapshot_before(as_of)
+        return None if snapshot is None else snapshot.positions
+
+    def load_latest_positions_snapshot(self) -> PositionSnapshot | None:
+        return self.load_positions_snapshot_before(pd.Timestamp.max)
 
     def load_positions(self) -> pd.DataFrame:
         if not self.positions_path.exists():
@@ -56,6 +113,7 @@ class PortfolioStore:
         *,
         snapshot_as_of: str | pd.Timestamp | None = None,
     ) -> None:
+        self._complete_pending_snapshot_write()
         df = df.copy()
         if "as_of" not in df.columns:
             df.insert(0, "as_of", pd.Timestamp.now())
@@ -91,7 +149,26 @@ class PortfolioStore:
 
         combined = combined.drop_duplicates(subset=["as_of", "ticker"], keep="last")
         combined = combined.sort_values(["as_of", "ticker"], kind="mergesort").reset_index(drop=True)
-        combined.to_csv(self.positions_path, index=False)
+
+        snapshot_dates = pd.Series(dtype="datetime64[ns]")
+        if self.snapshots_path.exists():
+            snapshots = pd.read_csv(self.snapshots_path)
+            if "as_of" in snapshots.columns:
+                snapshot_dates = pd.to_datetime(
+                    snapshots["as_of"], errors="coerce"
+                ).dropna().dt.normalize()
+            elif not snapshots.empty:
+                logging.warning("portfolio_snapshots.csv hat keine 'as_of'-Spalte und wird ersetzt.")
+
+        all_snapshot_dates = sorted(set(snapshot_dates) | replacement_as_of)
+        combined.to_csv(self.positions_pending_path, index=False)
+        pd.DataFrame({"as_of": all_snapshot_dates}).to_csv(
+            self.snapshots_staging_path,
+            index=False,
+        )
+        self._replace_file(self.snapshots_staging_path, self.snapshots_pending_path)
+        self._replace_file(self.positions_pending_path, self.positions_path)
+        self._replace_file(self.snapshots_pending_path, self.snapshots_path)
 
     def last_rebalance_time(self):
         """JÃ¼ngsten Timestamp aus runs_log oder positions ermitteln (robust)."""
@@ -107,12 +184,10 @@ class PortfolioStore:
                 # Falls die Datei mal wieder â€žkrummâ€œ ist, einfach ignorieren.
                 pass
 
-        if ts is None and self.positions_path.exists():
-            p = pd.read_csv(self.positions_path)
-            if "as_of" in p.columns:
-                p["as_of"] = pd.to_datetime(p["as_of"], errors="coerce")
-                if not p["as_of"].isna().all():
-                    ts = p["as_of"].max()
+        if ts is None:
+            snapshot = self.load_latest_positions_snapshot()
+            if snapshot is not None:
+                ts = snapshot.as_of
         return ts
 
     def append_run(self, **meta) -> None:
