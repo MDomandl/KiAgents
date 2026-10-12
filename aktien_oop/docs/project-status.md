@@ -23,8 +23,11 @@ Portfolio-Snapshots:
   statt nur übereinstimmende Ticker zu aktualisieren.
 - Ein ausdrücklich leerer Snapshot entfernt über `snapshot_as_of` die bisherigen
   Positionen dieses Stichtags. Ältere und neuere Stichtage bleiben erhalten.
-- `load_positions_before()` liefert damit den letzten vollständig ersetzten
-  Snapshot vor dem angefragten Stichtag und keine veralteten Restpositionen.
+- `load_positions_before()` berücksichtigt bei nicht leeren Snapshots die
+  vollständige Ersetzung und liefert den letzten gespeicherten Stichtag vor der
+  Anfrage. Ein leerer Snapshot wird jedoch nur durch Entfernen seiner Zeilen
+  abgebildet; es bleibt kein Leer-Marker erhalten. Eine spätere Abfrage kann
+  deshalb auf einen älteren, nicht leeren Snapshot zurückfallen.
 
 Diese Semantik ist für `automation-agents` relevant, weil dessen Vergleiche,
 Seed-Logik und Reports die Konfigurationswerte sowie Backtest- und Runner-Artefakte
@@ -65,3 +68,9 @@ Zielregel „Agenten koordinieren, Side Effects liegen in Infrastructure“ noch
 nicht überall technisch erzwungen. Beides ist bei späteren Refactorings als
 Kompatibilitäts- beziehungsweise Architekturrisiko zu behandeln; dieser
 Dokumentationsstand nimmt keine entsprechende Produktionsänderung vorweg.
+
+Zusätzlich kann `PortfolioStore` einen ausdrücklich leeren historischen Snapshot
+nicht dauerhaft von einem fehlenden Snapshot unterscheiden. Verbraucher wie die
+Seed-Logik in `automation-agents` müssen diesen Rückfall auf ältere Bestände
+berücksichtigen, bis ein kompatibler Leer-Marker-Vertrag fachlich festgelegt und
+in beiden Projekten abgesichert ist.
