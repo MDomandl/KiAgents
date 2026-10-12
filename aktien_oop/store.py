@@ -23,6 +23,7 @@ class PortfolioStore:
         self.positions_pending_path = self.save_dir / "portfolio_positions.csv.pending"
         self.snapshots_pending_path = self.save_dir / "portfolio_snapshots.csv.pending"
         self.snapshots_staging_path = self.save_dir / "portfolio_snapshots.csv.pending.tmp"
+        self._complete_pending_snapshot_write()
         self.rankings_log   = self.save_dir / "rankings_log.csv"
         self.runs_log       = self.save_dir / "runs_log.csv"
         self.topk_log       = self.save_dir / "topk_log.csv"

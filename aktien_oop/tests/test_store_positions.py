@@ -94,6 +94,7 @@ def test_load_positions_before_does_not_fall_back_past_empty_snapshot(tmp_path):
     store = PortfolioStore(tmp_path)
     store.save_positions(pd.DataFrame([
         {"as_of": "2025-09-30", "ticker": "OLD", "allocation_pct": 100.0},
+        {"as_of": "2025-10-31", "ticker": "STALE", "allocation_pct": 100.0},
     ]))
     store.save_positions(
         pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"]),
@@ -142,17 +143,14 @@ def test_interrupted_empty_snapshot_write_remains_authoritatively_flat(
     assert prev is not None
     assert prev.empty
 
-    monkeypatch.setattr(store, "_replace_file", replace_file)
-    store.save_positions(pd.DataFrame([
-        {"as_of": "2025-11-30", "ticker": "NEW", "allocation_pct": 100.0},
-    ]))
+    recovered_store = PortfolioStore(tmp_path)
+    recovered_empty = recovered_store.load_positions_before("2025-11-15")
+    canonical_positions = recovered_store.load_positions()
 
-    recovered_empty = store.load_positions_before("2025-11-15")
-    recovered_non_empty = store.load_positions_before("2025-12-15")
-    assert not store.snapshots_pending_path.exists()
+    assert not recovered_store.snapshots_pending_path.exists()
+    assert not recovered_store.positions_pending_path.exists()
     assert recovered_empty is not None and recovered_empty.empty
-    assert recovered_non_empty is not None
-    assert recovered_non_empty["ticker"].tolist() == ["NEW"]
+    assert canonical_positions["ticker"].tolist() == ["OLD"]
 
 
 def test_snapshot_history_supports_non_empty_empty_non_empty_transition(tmp_path):
