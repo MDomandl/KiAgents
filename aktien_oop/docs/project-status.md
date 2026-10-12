@@ -58,7 +58,7 @@ Die fokussierten Regressionstests liegen insbesondere in
 unter `aktien_oop/tests` geprüft.
 
 Der dokumentierte Stand wurde am 12. Oktober 2026 mit Python 3.11.9 und den
-synchronisierten Entwicklungsabhängigkeiten geprüft: `33 passed`. Dabei traten
+synchronisierten Entwicklungsabhängigkeiten geprüft: `34 passed`. Dabei traten
 zwei bekannte NumPy-`RuntimeWarning`s im Test des leeren Backtest-Snapshots auf;
 sie führten nicht zu Testfehlern.
 

@@ -19,9 +19,7 @@ class Rebalancer:
 
     def should_rebalance(self) -> bool:
         if self.force: return True
-        prev = self.store.read_positions()
-        if prev.empty: return True
-        last = pd.to_datetime(prev["as_of"].max(), errors="coerce")
+        last = pd.to_datetime(self.store.last_rebalance_time(), errors="coerce")
         if pd.isna(last): return True
         return last.strftime("%Y-%m") != pd.Timestamp.now().strftime("%Y-%m")
 

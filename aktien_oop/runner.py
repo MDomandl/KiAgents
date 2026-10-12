@@ -329,9 +329,13 @@ class Runner:
         return a.to_period("M") == b.to_period("M")
 
     def _print_existing_positions(self) -> None:
-        pos = self.store.load_positions()
-        if pos.empty:
+        snapshot = self.store.load_latest_positions_snapshot()
+        if snapshot is None:
             print("⚠️  Keine gespeicherten Positionen gefunden.")
+            return
+        pos = snapshot.positions
+        if pos.empty:
+            print(f"Bestehendes Portfolio ist seit {snapshot.as_of.date()} flat.")
             return
 
         # Sektor-Spalte anreichern, falls Meta vorhanden

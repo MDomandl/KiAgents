@@ -96,6 +96,9 @@ class PortfolioStore:
         snapshot = self.load_positions_snapshot_before(as_of)
         return None if snapshot is None else snapshot.positions
 
+    def load_latest_positions_snapshot(self) -> PositionSnapshot | None:
+        return self.load_positions_snapshot_before(pd.Timestamp.max)
+
     def load_positions(self) -> pd.DataFrame:
         if not self.positions_path.exists():
             return pd.DataFrame()
@@ -181,12 +184,10 @@ class PortfolioStore:
                 # Falls die Datei mal wieder â€žkrummâ€œ ist, einfach ignorieren.
                 pass
 
-        if ts is None and self.positions_path.exists():
-            p = pd.read_csv(self.positions_path)
-            if "as_of" in p.columns:
-                p["as_of"] = pd.to_datetime(p["as_of"], errors="coerce")
-                if not p["as_of"].isna().all():
-                    ts = p["as_of"].max()
+        if ts is None:
+            snapshot = self.load_latest_positions_snapshot()
+            if snapshot is not None:
+                ts = snapshot.as_of
         return ts
 
     def append_run(self, **meta) -> None:
