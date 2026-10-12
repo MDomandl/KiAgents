@@ -43,6 +43,9 @@ def test_save_positions_replaces_snapshot_with_empty_snapshot_for_same_as_of(tmp
     assert saved["as_of"].astype(str).str.startswith("2025-10-31").all()
     assert saved["ticker"].tolist() == ["BBB"]
 
+    snapshots = pd.read_csv(store.snapshots_path)
+    assert snapshots["as_of"].astype(str).str.startswith("2025-09-30").any()
+
 
 def test_load_positions_before_uses_latest_replaced_snapshot(tmp_path):
     store = PortfolioStore(tmp_path)
@@ -57,5 +60,81 @@ def test_load_positions_before_uses_latest_replaced_snapshot(tmp_path):
 
     prev = store.load_positions_before("2025-10-08")
 
+    assert prev is not None
+    assert prev["ticker"].tolist() == ["AAA"]
+
+
+def test_load_positions_snapshot_before_distinguishes_missing_empty_and_non_empty(tmp_path):
+    store = PortfolioStore(tmp_path)
+
+    assert store.load_positions_snapshot_before("2025-09-01") is None
+
+    store.save_positions(
+        pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"]),
+        snapshot_as_of="2025-09-30",
+    )
+    empty = store.load_positions_snapshot_before("2025-10-01")
+
+    assert empty is not None
+    assert empty.as_of == pd.Timestamp("2025-09-30")
+    assert empty.positions.empty
+
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-10-31", "ticker": "AAA", "allocation_pct": 100.0},
+    ]))
+    populated = store.load_positions_snapshot_before("2025-11-01")
+
+    assert populated is not None
+    assert populated.as_of == pd.Timestamp("2025-10-31")
+    assert populated.positions["ticker"].tolist() == ["AAA"]
+
+
+def test_load_positions_before_does_not_fall_back_past_empty_snapshot(tmp_path):
+    store = PortfolioStore(tmp_path)
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-09-30", "ticker": "OLD", "allocation_pct": 100.0},
+    ]))
+    store.save_positions(
+        pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"]),
+        snapshot_as_of="2025-10-31",
+    )
+
+    prev = store.load_positions_before("2025-11-15")
+
+    assert prev is not None
+    assert prev.empty
+
+
+def test_snapshot_history_supports_non_empty_empty_non_empty_transition(tmp_path):
+    store = PortfolioStore(tmp_path)
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-09-30", "ticker": "OLD", "allocation_pct": 100.0},
+    ]))
+    store.save_positions(
+        pd.DataFrame(columns=["as_of", "ticker", "allocation_pct"]),
+        snapshot_as_of="2025-10-31",
+    )
+    store.save_positions(pd.DataFrame([
+        {"as_of": "2025-11-30", "ticker": "NEW", "allocation_pct": 100.0},
+    ]))
+
+    september = store.load_positions_before("2025-10-15")
+    october = store.load_positions_before("2025-11-15")
+    november = store.load_positions_before("2025-12-15")
+
+    assert september is not None and september["ticker"].tolist() == ["OLD"]
+    assert october is not None and october.empty
+    assert november is not None and november["ticker"].tolist() == ["NEW"]
+
+
+def test_load_positions_before_supports_legacy_positions_csv_without_snapshot_index(tmp_path):
+    store = PortfolioStore(tmp_path)
+    pd.DataFrame([
+        {"as_of": "2025-09-30", "ticker": "AAA", "allocation_pct": 100.0},
+    ]).to_csv(store.positions_path, index=False)
+
+    prev = store.load_positions_before("2025-10-01")
+
+    assert not store.snapshots_path.exists()
     assert prev is not None
     assert prev["ticker"].tolist() == ["AAA"]

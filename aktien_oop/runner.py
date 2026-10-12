@@ -18,7 +18,7 @@ from dataclasses import asdict
 from .config import Config, normalize_ticker, setup_logging
 from .data_client import DataClient
 from .engine import SignalEngine
-from .store import PortfolioStore
+from .store import PortfolioStore, PositionSnapshot
 from .rebalance import Rebalancer
 from .universe import load_tickers as load_universe_tickers, universe_hash
 
@@ -56,6 +56,10 @@ def _series_to_dict(s):
 
     # Fallback: alles, was sich wie ein Mapping/Iterable verhält
     return {str(k): float(v) for k, v in dict(s).items()}
+
+
+def _is_first_run(previous_snapshot: PositionSnapshot | None) -> bool:
+    return previous_snapshot is None
 
 
 def _classify_friction_action(prev_weight: float, target_weight: float, friction_eps: float) -> str:
@@ -639,11 +643,12 @@ class Runner:
         logging.debug("RUN CalcParams dump: %s", cp_path)
 
         # === prev_holdings für Turnover-Buffer (aus Snapshot VOR as_of) ===
-        prev_df = self.store.load_positions_before(as_of_str)  # BEFORE!
+        prev_snapshot = self.store.load_positions_snapshot_before(as_of_str)  # BEFORE!
+        prev_df = None if prev_snapshot is None else prev_snapshot.positions
         old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
         prev_holdings = list(old_w.keys())
 
-        is_first_run = (prev_df is None) or (len(prev_df) == 0)
+        is_first_run = _is_first_run(prev_snapshot)
         if is_first_run:
             logging.info(
                 "[RUN] first_run_no_prev_state=True (no positions before as_of=%s)",
@@ -794,7 +799,8 @@ class Runner:
         # --- Decision-Bundle (Runner) ---
         if getattr(self.cfg, "dump_decision_bundles", False):
             # alte Gewichte (aus letzter positions.csv)
-            prev_df = self.store.load_positions_before(as_of_str)
+            prev_snapshot = self.store.load_positions_snapshot_before(as_of_str)
+            prev_df = None if prev_snapshot is None else prev_snapshot.positions
             old_w = self._weights_from_positions(prev_df) if prev_df is not None else {}
 
             # neue Gewichte (aus aktueller Auswahl)
